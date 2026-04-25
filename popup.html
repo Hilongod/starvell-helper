@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Starvell Helper</title>
+  <style>
+    :root {
+      --bg:      #0f0f17;
+      --surface: #1a1a28;
+      --border:  #2e2e45;
+      --accent:  #7c5cfc;
+      --accent2: #a07cff;
+      --text:    #e8e8f0;
+      --muted:   #8888aa;
+      --green:   #4caf82;
+      --red:     #f25c5c;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 13px;
+    }
+
+    /* ── Header ── */
+    .header {
+      background: linear-gradient(135deg, #1e1a40, #2a1a50);
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .header-logo {
+      width: 32px; height: 32px;
+      background: var(--accent);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+    }
+    .header-title { font-size: 15px; font-weight: 700; letter-spacing: 0.3px; }
+    .header-sub   { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .badge {
+      margin-left: auto;
+      font-size: 10px;
+      background: rgba(124,92,252,0.2);
+      color: var(--accent2);
+      border: 1px solid rgba(124,92,252,0.3);
+      border-radius: 20px;
+      padding: 2px 8px;
+    }
+
+    /* ── Sections ── */
+    .section {
+      border-bottom: 1px solid var(--border);
+      padding: 14px 16px;
+    }
+    .section-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+
+    /* ── Toggle row ── */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .toggle-label { font-size: 13px; font-weight: 500; }
+    .toggle-desc  { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+    /* ── Switch ── */
+    .switch { position: relative; display: inline-block; width: 40px; height: 22px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; inset: 0;
+      background: #333350;
+      border-radius: 22px;
+      cursor: pointer;
+      transition: 0.25s;
+    }
+    .slider::before {
+      content: '';
+      position: absolute;
+      left: 3px; top: 3px;
+      width: 16px; height: 16px;
+      background: #fff;
+      border-radius: 50%;
+      transition: 0.25s;
+    }
+    input:checked + .slider { background: var(--accent); }
+    input:checked + .slider::before { transform: translateX(18px); }
+
+    /* ── Interval ── */
+    .interval-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .interval-row label { color: var(--muted); font-size: 12px; flex: 1; }
+    .interval-row select {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    /* ── Status badge ── */
+    .status-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--muted);
+    }
+    .dot.active { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .dot.inactive { background: var(--red); }
+
+    /* ── Buttons ── */
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 8px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: 0.2s;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), #5a3fd0);
+      color: #fff;
+    }
+    .btn-primary:hover { filter: brightness(1.15); }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; filter: none; }
+    .btn-secondary {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      margin-top: 6px;
+    }
+    .btn-secondary:hover { border-color: var(--accent); color: var(--accent2); }
+
+    /* ── Input ── */
+    input[type="text"], input[type="url"] {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 10px;
+      color: var(--text);
+      font-size: 12px;
+      margin-bottom: 8px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="text"]:focus, input[type="url"]:focus { border-color: var(--accent); }
+
+    /* ── Opacity slider ── */
+    .range-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .range-row label { font-size: 12px; color: var(--muted); width: 80px; flex-shrink: 0; }
+    input[type="range"] {
+      flex: 1;
+      accent-color: var(--accent);
+    }
+    .range-val { font-size: 12px; width: 30px; text-align: right; color: var(--accent2); }
+
+    /* ── BG presets ── */
+    .presets {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .preset-btn {
+      flex: 1;
+      min-width: 70px;
+      padding: 5px 4px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--text);
+      font-size: 11px;
+      cursor: pointer;
+      text-align: center;
+      transition: 0.15s;
+    }
+    .preset-btn:hover { border-color: var(--accent); }
+
+    /* ── Feedback ── */
+    .feedback {
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 5px;
+      margin-top: 6px;
+      display: none;
+    }
+    .feedback.ok   { background: rgba(76,175,130,0.15); color: var(--green); display: block; }
+    .feedback.err  { background: rgba(242,92,92,0.15);  color: var(--red);   display: block; }
+
+    /* ── Footer ── */
+    .footer {
+      padding: 10px 16px;
+      text-align: center;
+      font-size: 10px;
+      color: #44445a;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-logo">⭐</div>
+  <div>
+    <div class="header-title">Starvell Helper</div>
+    <div class="header-sub">Инструменты продавца</div>
+  </div>
+  <span class="badge">v1.0</span>
+</div>
+
+<!-- ── СЕКЦИЯ 1: Автоподнятие ── -->
+<div class="section">
+  <div class="section-title">🚀 Автоподнятие лотов</div>
+
+  <div class="toggle-row">
+    <div>
+      <div class="toggle-label">Включить автоподнятие</div>
+      <div class="toggle-desc">Автоматически нажимает «Поднять» для всех лотов</div>
+    </div>
+    <label class="switch">
+      <input type="checkbox" id="autoBoostToggle" />
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div class="interval-row">
+    <label>Интервал подъёма</label>
+    <select id="boostInterval">
+      <option value="5">5 минут</option>
+      <option value="10">10 минут</option>
+      <option value="15">15 минут</option>
+      <option value="30" selected>30 минут</option>
+      <option value="60">1 час</option>
+      <option value="120">2 часа</option>
+    </select>
+  </div>
+
+  <div class="status-box" id="boostStatus">
+    <div class="dot inactive" id="boostDot"></div>
+    <span id="boostStatusText">Автоподнятие выключено</span>
+  </div>
+
+  <div id="boostHint" style="display:none; font-size:11px; color:#a07cff; background:rgba(124,92,252,0.1); border:1px solid rgba(124,92,252,0.25); border-radius:6px; padding:6px 10px; margin-bottom:8px; line-height:1.4;"></div>
+  <button class="btn btn-primary" id="boostNowBtn">⬆ Поднять сейчас</button>
+  <div class="feedback" id="boostFeedback"></div>
+</div>
+
+<!-- ── СЕКЦИЯ 2: Кастомный фон ── -->
+<div class="section">
+  <div class="section-title">🎨 Кастомный фон</div>
+
+  <div class="toggle-row">
+    <div>
+      <div class="toggle-label">Включить фон</div>
+      <div class="toggle-desc">Кастомный фон можно поставить свой по "прямой ссылке"</div>
+    </div>
+    <label class="switch">
+      <input type="checkbox" id="bgToggle" />
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <div id="bgControls">
+    <input type="url" id="bgUrl" placeholder="https://... ссылка на изображение" />
+
+    <div class="range-row">
+      <label>Проявление</label>
+      <input type="range" id="bgOpacity" min="0" max="100" value="15" />
+      <span class="range-val" id="opacityVal">15%</span>
+    </div>
+
+    <div class="presets">
+  <button class="preset-btn" data-url="https://i.postimg.cc/mZy8NG2Y/1304290-(1).png">☠️ Аниме v1</button>
+  <button class="preset-btn" data-url="https://i.postimg.cc/7hH1QfYt/devushka-reka-zakat-1067581-1920x1080.jpg">🌟 Аниме v2</button>
+  <button class="preset-btn" data-url="https://images.unsplash.com/photo-1518531933037-91b2f5f229cc?w=1920">🌲 Лес</button>
+  <button class="preset-btn" data-url="https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=1920">🏔 Горы</button>
+</div>
+
+    <button class="btn btn-primary" id="applyBgBtn">✓ Применить фон</button>
+    <button class="btn btn-secondary" id="removeBgBtn">✕ Убрать фон</button>
+  </div>
+  <div class="feedback" id="bgFeedback"></div>
+</div>
+
+<div class="footer">Работает на starvell.com</div>
+
+<script src="popup.js"></script>
+</body>
+</html>
