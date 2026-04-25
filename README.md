@@ -38,7 +38,6 @@
 ## 🖼️ Скриншоты
 
 > *(![](https://i.postimg.cc/7Yy8vZMf/2026-04-25-23-08-56.png))*
-> *(![](https://i.postimg.cc/R0tLz4Tx/2026-04-25-23-21-15.png))*
 > *(![](https://i.postimg.cc/vZJ5hCwL/2026-04-25-23-49-51.png))*
 
 ---
