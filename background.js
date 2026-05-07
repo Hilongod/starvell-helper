@@ -2,7 +2,21 @@
 //  Starvell Helper — background.js (Service Worker)
 // =====================================================
 
-// Слушаем сообщения от content.js и popup.js
+// Клик по иконке расширения → открываем /starvell-helper
+chrome.action.onClicked.addListener(() => {
+  chrome.tabs.query({ url: 'https://starvell.com/*' }, (tabs) => {
+    if (tabs.length > 0) {
+      // Есть вкладка Starvell — переходим в ней
+      chrome.tabs.update(tabs[0].id, { url: 'https://starvell.com/starvell-helper', active: true });
+      chrome.windows.update(tabs[0].windowId, { focused: true });
+    } else {
+      // Нет вкладки — открываем новую
+      chrome.tabs.create({ url: 'https://starvell.com/starvell-helper' });
+    }
+  });
+});
+
+// Слушаем сообщения от content.js
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // Уведомление
