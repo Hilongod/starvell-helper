@@ -1,3 +1,5 @@
+// ===== Starvell Helper — BUILD 2026-07-07-tickets =====
+console.log("%c[Starvell Helper] BUILD 2026-07-07-tickets загружен","color:#7c5cfc;font-weight:bold");
 // =====================================================
 //  Starvell Helper — content.js
 // =====================================================
@@ -31,21 +33,24 @@ chrome.storage.local.get(['lastBumpPayload'], (data) => {
 });
 
 const originalFetch = window.fetch;
-window.fetch = async function(...args) {
-  const result = await originalFetch.apply(this, args);
-  try {
-    const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
-    const options = args[1];
-    if (url && url.includes('/api/offers/bump') && options?.method === 'POST') {
-      const body = JSON.parse(options.body);
-      if (body.gameId && body.categoryIds?.length > 0) {
-        lastBumpPayload = body;
-        chrome.storage.local.set({ lastBumpPayload: body });
-        console.log('[Starvell Helper] Перехвачен bump, запомнили:', body);
+window.fetch = function(...args) {
+  const promise = originalFetch.apply(this, args);
+  // Обрабатываем ответ асинхронно, не блокируя основной поток
+  promise.then(async response => {
+    try {
+      const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+      const options = args[1];
+      if (url && url.includes('/api/offers/bump') && options?.method === 'POST') {
+        const body = JSON.parse(options.body);
+        if (body.gameId && body.categoryIds?.length > 0) {
+          lastBumpPayload = body;
+          await chrome.storage.local.set({ lastBumpPayload: body });
+          console.log('[Starvell Helper] Перехвачен bump, запомнили:', body);
+        }
       }
-    }
-  } catch (e) {}
-  return result;
+    } catch(e) {}
+  }).catch(() => {});
+  return promise;
 };
 
 // ─── Слушаем команды от popup ────────────────────────
@@ -61,7 +66,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       break;
     case 'BOOST_NOW':
-      boostAllLots().then(result => sendResponse({ ok: true, ...result }));
+      boostAllLots()
+        .then(result => sendResponse({ ok: true, ...result }))
+        .catch(err => sendResponse({ ok: false, error: String(err && err.message || err) }));
       return true;
     case 'APPLY_BG':
       applyBackground(msg.url, msg.opacity);
@@ -84,77 +91,139 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 function startAutoBoost(intervalMinutes) {
   stopAutoBoost();
   boostIntervalMs = (intervalMinutes || 30) * 60 * 1000;
-  boostAllLots();
-  autoBoostInterval = setInterval(() => boostAllLots(), boostIntervalMs);
-  console.log('[Starvell Helper] Автоподнятие запущено, интервал:', intervalMinutes, 'мин');
+  // За расписание отвечает ТОЛЬКО alarm в background (шлёт BOOST_NOW).
+  // Локальный setInterval здесь дублировал бы поднятие на каждой вкладке → 429.
+  autoBoostInterval = 'managed-by-alarm';
+  console.log('[Starvell Helper] Автоподнятие запущено (расписание в background), интервал:', intervalMinutes, 'мин');
 }
 
 function stopAutoBoost() {
   if (autoBoostInterval) {
-    clearInterval(autoBoostInterval);
+    if (typeof autoBoostInterval === 'number') clearInterval(autoBoostInterval);
     autoBoostInterval = null;
   }
 }
 
-async function getBumpPayload() {
-  if (lastBumpPayload?.gameId && lastBumpPayload?.categoryIds?.length > 0) return lastBumpPayload;
-  const categories = await fetchMyCategoryIds();
-  if (categories) return categories;
-  return getPayloadFromUrl();
-}
-
-async function fetchMyCategoryIds() {
-  try {
-    const resp = await originalFetch('/api/orders/list', {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({
-        filter: { status: 'COMPLETED', gameId: null, userType: 'seller' },
-        with: { buyer: false },
-        limit: 50,
-        offset: 0
-      })
-    });
-    if (!resp.ok) return null;
-    const orders = await resp.json();
-    const list = Array.isArray(orders) ? orders : (orders.orders || orders.items || []);
-    if (!list.length) return null;
-
-    // Берём самый частый gameId среди последних продаж
-    const gameCount = {};
-    list.forEach(o => {
-      const g = o.offerDetails?.game?.id;
-      if (g) gameCount[g] = (gameCount[g] || 0) + 1;
-    });
-    const gameId = parseInt(Object.entries(gameCount).sort((a, b) => b[1] - a[1])[0]?.[0]);
-    if (!gameId) return null;
-
-    // Собираем все уникальные категории этой игры
-    const catSet = new Set();
-    list.forEach(o => {
-      if (o.offerDetails?.game?.id === gameId) {
-        const catId = o.offerDetails?.category?.id;
-        if (catId) catSet.add(catId);
-      }
-    });
-
-    if (catSet.size === 0) return null;
-    console.log('[Starvell Helper] Авто-определены категории:', gameId, Array.from(catSet));
-    return { gameId, categoryIds: Array.from(catSet) };
-  } catch (e) {
-    console.warn('[Starvell Helper] fetchMyCategoryIds error:', e);
-    return null;
+// ─── Узнать username текущего пользователя ───
+function getCurrentUsername() {
+  // 1) из __NEXT_DATA__ (если есть)
+  const nd = document.getElementById('__NEXT_DATA__');
+  if (nd) {
+    try {
+      const data = JSON.parse(nd.textContent);
+      const pp = data.props?.pageProps || {};
+      const u = pp.user?.username
+             || pp.bff?.user?.username
+             || pp.foreignProfileUser?.username;
+      if (u) return u;
+    } catch (e) {}
   }
+  // 2) запасной вариант — из URL вида /profile/<username> или /<username>
+  const m = location.pathname.match(/\/profile\/([^/?#]+)/i);
+  if (m) return decodeURIComponent(m[1]);
+  return null;
 }
+ 
+// ─── Получить buildId (нужен для пути _next/data) ───
+async function fetchBuildId() {
+  const nd = document.getElementById('__NEXT_DATA__');
+  if (nd) {
+    try {
+      const data = JSON.parse(nd.textContent);
+      if (data.buildId) return data.buildId;
+    } catch (e) {}
+  }
+  // подстраховка: тянем главную и выдёргиваем buildId из inline-скрипта
+  const html = await originalFetch(window.location.origin, { credentials: 'include' }).then(r => r.text());
+  const match = html.match(/"buildId":"(.*?)"/);
+  if (match) return match[1];
+  throw new Error('buildId not found');
+}
+ 
+// ─── ЧТЕНИЕ ЛОТОВ: /profile/{username}.json ───
+// Возвращает массив категорий: [{ categoryId, gameId, gameName, offersCount }]
+async function fetchAllActiveCategories() {
+  let username = getCurrentUsername();
+  if (!username) {
+    addLog('error', 'Не удалось определить username — открой свою страницу профиля.');
+    return [];
+  }
+  // Сайт хранит username как "HILONGOD", но канонический URL профиля — в нижнем
+  // регистре (/profile/hilongod). Если слать как есть, сервер отвечает 308-редиректом
+  // с пустым pageProps. Поэтому нормализуем в нижний регистр.
+  username = username.toLowerCase();
 
-function getPayloadFromUrl() {
-  const m = location.pathname.match(/\/(?:roblox|games\/(\d+))/);
-  const gameId = m?.[1] ? parseInt(m[1]) : 1;
-  const catMatch = location.pathname.match(/\/categories\/(\d+)/);
-  if (catMatch) return { gameId, categoryIds: [parseInt(catMatch[1])] };
-  // Последний фоллбэк — самые популярные категории Roblox
-  return { gameId: 1, categoryIds: [55, 3, 38, 44, 74, 101, 105, 118] };
+  const buildId = await fetchBuildId();
+
+  // Загружаем профиль, при необходимости следуем за внутренним N_REDIRECT Next.js
+  async function loadProfileJson(uname, depth = 0) {
+    const url = `${location.origin}/_next/data/${buildId}/profile/`
+              + `${encodeURIComponent(uname)}.json?username=${encodeURIComponent(uname)}`;
+    const resp = await originalFetch(url, {
+      credentials: 'include',
+      headers: { 'x-nextjs-data': '1' }
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const json = await resp.json();
+    // Next.js может вернуть { pageProps: { __N_REDIRECT: "/profile/xxx" } }
+    const redirect = json?.pageProps?.__N_REDIRECT;
+    if (redirect && depth < 2) {
+      const m = redirect.match(/\/profile\/([^/?#]+)/i);
+      if (m) {
+        const target = decodeURIComponent(m[1]);
+        if (target.toLowerCase() !== uname.toLowerCase()) {
+          return loadProfileJson(target.toLowerCase(), depth + 1);
+        }
+      }
+    }
+    return json;
+  }
+
+  let data;
+  try {
+    data = await loadProfileJson(username);
+  } catch (e) {
+    addLog('error', `Не удалось загрузить профиль: ${e.message}`);
+    return [];
+  }
+ 
+  const pp = data.pageProps || {};
+  // userProfileOffers лежит и наверху, и в bff — берём первый непустой
+  const categories = (Array.isArray(pp.userProfileOffers) && pp.userProfileOffers.length)
+      ? pp.userProfileOffers
+      : (pp.bff?.userProfileOffers || []);
+ 
+  const result = [];
+  for (const cat of categories) {
+    const categoryId = cat.id;
+    const gameId     = cat.gameId ?? cat.game?.id;
+    const offersCnt  = Array.isArray(cat.offers) ? cat.offers.length : 0;
+    // поднимаем только категории, где реально есть офферы
+    if (!categoryId || !gameId || offersCnt === 0) continue;
+    result.push({
+      categoryId,
+      gameId,
+      gameName: cat.game?.name || String(gameId),
+      offersCount: offersCnt
+    });
+  }
+ 
+  addLog('info', `Профиль загружен: категорий с лотами — ${result.length}.`);
+  return result;
+}
+ 
+// ─── Группировка: gameId -> [categoryIds] (как делает сайт) ───
+function groupByGame(categories) {
+  const map = new Map(); // gameId -> { gameName, categoryIds:Set }
+  for (const c of categories) {
+    if (!map.has(c.gameId)) map.set(c.gameId, { gameName: c.gameName, categoryIds: new Set() });
+    map.get(c.gameId).categoryIds.add(c.categoryId);
+  }
+  return [...map.entries()].map(([gameId, v]) => ({
+    gameId,
+    gameName: v.gameName,
+    categoryIds: [...v.categoryIds]
+  }));
 }
 
 async function sendBump(gameId, categoryIds) {
@@ -187,55 +256,145 @@ async function sendBump(gameId, categoryIds) {
   }
 }
 
+// ─── ГЛАВНАЯ: поднять все игры (по одному bump на игру) ───
+let boostInProgress = false;
+
 async function boostAllLots() {
-  const payload = await getBumpPayload();
-  if (!payload.gameId) {
-    const msg = '⚠ Не удалось определить игру. Нажми «Поднять» вручную один раз.';
-    chrome.runtime.sendMessage({ type: 'SHOW_NOTIFICATION', text: msg });
+  // Защита от наложения: два BOOST_NOW внахлёст удвоили бы запросы → 429.
+  if (boostInProgress) {
+    console.log('[Starvell Helper] boostAllLots уже выполняется — пропускаю');
+    return { count: 0, failed: 0, rateLimit: false, skipped: true };
+  }
+  boostInProgress = true;
+  try {
+    return await _boostAllLotsInner();
+  } finally {
+    boostInProgress = false;
+  }
+}
+
+async function _boostAllLotsInner() {
+  const categories = await fetchAllActiveCategories();
+  if (!categories.length) {
+    const msg = '⚠ Активных лотов не найдено. Открой свою страницу профиля и попробуй снова.';
     addLog('error', msg);
+    chrome.runtime.sendMessage({ type: 'SHOW_NOTIFICATION', text: msg });
     return { count: 0, failed: 1, rateLimit: false };
   }
-  const result = await sendBump(payload.gameId, payload.categoryIds);
-  let msg;
-  if (result.status === 429) {
-    msg = '⚠ Rate limit — сервер ограничивает. Увеличь интервал до 60+ мин.';
-    addLog('warn', msg);
-  } else if (result.ok) {
-    msg = `✅ Лоты подняты! (gameId=${payload.gameId}, ${payload.categoryIds.length} категорий)`;
-    addLog('ok', msg);
-  } else {
-    msg = `⚠ Ошибка ${result.status}. Проверь F12 → Console.`;
-    addLog('error', msg);
+ 
+  const games = groupByGame(categories);
+  addLog('info', `Поднимаю ${games.length} игр(ы), всего категорий: ${categories.length}.`);
+ 
+  let successCount = 0, failCount = 0, rateLimited = false;
+ 
+  for (let i = 0; i < games.length; i++) {
+    const { gameId, gameName, categoryIds } = games[i];
+    addLog('info', `${gameName} (id ${gameId}): ${categoryIds.length} категорий...`);
+ 
+    const result = await sendBumpWithRetry(gameId, categoryIds);
+ 
+    if (result.status === 429) {
+      rateLimited = true;
+      addLog('warn', `Rate limit на «${gameName}» — пауза 60с и один повтор.`);
+      await sleep(60000);
+      const retry = await sendBumpWithRetry(gameId, categoryIds);
+      if (retry.ok) { successCount++; addLog('ok', `✅ ${gameName} поднята (после паузы).`); }
+      else { failCount++; addLog('error', `❌ ${gameName}: ${retry.status}.`); }
+    } else if (result.ok) {
+      successCount++;
+      addLog('ok', `✅ ${gameName} поднята (${categoryIds.length} кат.).`);
+    } else {
+      failCount++;
+      addLog('error', `❌ Ошибка ${result.status} для «${gameName}».`);
+    }
+ 
+    if (i < games.length - 1) await sleep(2500); // пауза между играми против 429
   }
-  console.log('[Starvell Helper]', msg, result);
+ 
+  const msg = successCount
+    ? `✅ Поднято игр: ${successCount} из ${games.length}.`
+    : `⚠ Не удалось поднять ни одной игры.`;
   chrome.runtime.sendMessage({ type: 'SHOW_NOTIFICATION', text: msg });
-  return { count: result.ok ? 1 : 0, failed: result.ok ? 0 : 1, rateLimit: result.status === 429 };
+  addLog(successCount ? 'ok' : 'warn', msg);
+ 
+  return { count: successCount, failed: failCount, rateLimit: rateLimited };
+}
+ 
+
+// Вспомогательная функция с повторной попыткой при 429
+async function sendBumpWithRetry(gameId, categoryIds, retryCount = 0) {
+  const result = await sendBump(gameId, categoryIds);
+  if (result.status === 429 && retryCount < 2) {
+    const retryAfter = result.headers?.get('Retry-After') || 90;
+    addLog('warn', `429, ждём ${retryAfter} сек перед повтором...`);
+    await sleep(retryAfter * 1000);
+    return sendBumpWithRetry(gameId, categoryIds, retryCount + 1);
+  }
+  return result;
+}
+
+// Обновлённая sendBump, возвращающая объект с ok, status, headers
+async function sendBump(gameId, categoryIds) {
+  const body = JSON.stringify({ gameId, categoryIds });
+  console.log('[Starvell Helper] Отправляем bump:', body);
+  try {
+    const resp = await originalFetch('/api/offers/bump', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body
+    });
+    let json = {};
+    try { json = await resp.json(); } catch(e) {}
+    return {
+      ok: resp.ok,
+      status: resp.status,
+      body: json,
+      headers: resp.headers
+    };
+  } catch (e) {
+    console.error('[Starvell Helper] Ошибка fetch:', e);
+    return { ok: false, status: 0 };
+  }
 }
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 // ─── Лог событий ─────────────────────────────────────
-const boostLog = [];
+// Хранится в chrome.storage.local (ключ shLog).
+// background.js очищает его при onStartup — имитация сессии.
+const MAX_LOG = 200;
+
 function addLog(type, text) {
-  boostLog.unshift({ type, text, time: new Date().toLocaleTimeString('ru-RU') });
-  if (boostLog.length > 50) boostLog.pop();
-  renderLogIfOpen();
+  const entry = { type, text, time: new Date().toLocaleTimeString('ru-RU') };
+  chrome.storage.local.get(['shLog'], (data) => {
+    const log = data.shLog || [];
+    log.unshift(entry);
+    if (log.length > MAX_LOG) log.length = MAX_LOG;
+    chrome.storage.local.set({ shLog: log }, () => {
+      renderLogIfOpen();
+    });
+  });
 }
+
 function renderLogIfOpen() {
   const logList = document.getElementById('sh-log-list');
   if (logList) renderLog(logList);
 }
+
 function renderLog(container) {
-  if (!boostLog.length) {
-    container.innerHTML = '<div class="sh-log-empty">Пока нет событий</div>';
-    return;
-  }
-  container.innerHTML = boostLog.map(e => `
-    <div class="sh-log-row sh-log-${e.type}">
-      <span class="sh-log-time">${e.time}</span>
-      <span class="sh-log-text">${e.text}</span>
-    </div>
-  `).join('');
+  chrome.storage.local.get(['shLog'], (data) => {
+    const log = data.shLog || [];
+    if (!log.length) {
+      container.innerHTML = '<div class="sh-log-empty">Пока нет событий</div>';
+      return;
+    }
+    container.innerHTML = log.map(e => `
+      <div class="sh-log-row sh-log-${e.type}">
+        <span class="sh-log-time">${e.time}</span>
+        <span class="sh-log-text">${e.text}</span>
+      </div>
+    `).join('');
+  });
 }
 
 // =====================================================
@@ -460,7 +619,7 @@ function injectHelperPage() {
     <div id="sh-topbar">
       <div id="sh-topbar-logo">S</div>
       <span id="sh-topbar-name">Starvell Helper</span>
-      <span id="sh-topbar-badge">v2.0.0</span>
+      <span id="sh-topbar-badge">v2.1.1</span>
       <a href="https://starvell.com" id="sh-topbar-back">← На сайт</a>
     </div>
     <div id="sh-body">
@@ -468,6 +627,7 @@ function injectHelperPage() {
         <div class="sh-nav-section">Инструменты</div>
         <div class="sh-nav-item active" data-tab="boost"><span class="sh-nav-icon">🚀</span> Автоподнятие</div>
         <div class="sh-nav-item" data-tab="bg"><span class="sh-nav-icon">🎨</span> Кастомный фон</div>
+        <div class="sh-nav-item" data-tab="tickets"><span class="sh-nav-icon">🎫</span> Автотикеты</div>
         <div class="sh-nav-section">Данные</div>
         <div class="sh-nav-item" data-tab="stats"><span class="sh-nav-icon">📊</span> Статистика</div>
         <div class="sh-nav-item" data-tab="log"><span class="sh-nav-icon">📋</span> Лог событий</div>
@@ -568,6 +728,52 @@ function injectHelperPage() {
           </div>
         </div>
 
+         <!-- TAB: Автотикеты -->
+        <div class="sh-tab" id="sh-tab-tickets">
+          <div class="sh-page-header">
+            <div class="sh-page-title">🎫 Автотикеты (ТЕСТИТСЯ СИЛЬНО НЕ ПРИМЕНЯЙТЕ)</div>
+            <div class="sh-page-sub">Автоматические запросы в поддержку по неподтверждённым заказам</div>
+          </div>
+          <div class="sh-card" style="margin-bottom:14px;">
+            <div class="sh-toggle-row">
+              <div>
+                <div class="sh-toggle-label">Включить автотикеты</div>
+                <div class="sh-toggle-desc">Раз в сутки проверяет старые заказы и отправляет тикет</div>
+              </div>
+              <label class="sh-switch">
+                <input type="checkbox" id="sh-ticket-toggle" />
+                <span class="sh-slider"></span>
+              </label>
+            </div>
+            <div class="sh-row" style="gap:12px;align-items:center;margin-bottom:16px;">
+              <div style="flex:1;">
+                <div style="font-size:12px;color:#8888aa;margin-bottom:6px;">Порог ожидания</div>
+                <select class="sh-select" id="sh-ticket-period">
+                  <option value="1">🧪 1 день (тест)</option>
+                  <option value="7">1 неделя (7 дней)</option>
+                  <option value="14">2 недели (14 дней)</option>
+                  <option value="30">1 месяц (30 дней)</option>
+                </select>
+              </div>
+            </div>
+            <div id="sh-ticket-status" style="font-size:12px;color:#8888aa;margin-bottom:12px;">Статус: выключено</div>
+            <div id="sh-ticket-last" style="font-size:12px;color:#8888aa;margin-bottom:16px;"></div>
+            <button class="sh-btn sh-btn-primary" id="sh-ticket-now-btn">🎫 Отправить тикет сейчас</button>
+          </div>
+          <div class="sh-card" style="margin-bottom:14px;">
+            <div style="font-size:13px;font-weight:600;margin-bottom:10px;">Шаблон тикета</div>
+            <div style="font-size:12px;color:#8888aa;line-height:1.7;">
+              <b>Тема:</b> Покупатели забыли подтвердить заказы<br>
+              <b>Текст:</b> Здравствуйте, покупатели забыли подтвердить заказы в кол-ве [КОЛ-ВО] шт:<br>
+              [Заказ #XXXXXX, Заказ #YYYYYY ...]<br><br>
+              Там где не требуются доказательства (аренда или прочее), если на некоторые заказы нужны доказательства, напишите в тикет, при спорных моментах можно подключить поддержку (арбитраж)<br><br>
+              Реализация автотикет в расширении starvell-helper (пробный)
+            </div>
+          </div>
+          <div id="sh-ticket-feedback" class="sh-feedback" style="display:none;"></div>
+          <div id="sh-ticket-log" style="font-size:12px;color:#8888aa;margin-top:8px;"></div>
+        </div>
+
         <!-- TAB: Статистика -->
         <div class="sh-tab" id="sh-tab-stats">
           <div class="sh-page-header">
@@ -599,7 +805,7 @@ function injectHelperPage() {
           </div>
           <div class="sh-btn-row" style="margin-top:4px">
             <button class="sh-btn sh-btn-primary" id="sh-stats-load-btn">🔄 Загрузить статистику</button>
-            <button class="sh-btn sh-btn-secondary" id="sh-stats-all-btn" style="display:none">📥 Загрузить все</button>
+            <button class="sh-btn sh-btn-secondary" id="sh-stats-all-btn" style="display:none">📥 Загрузить все страницы</button>
           </div>
           <div style="font-size:11px;color:#44445a;margin-top:8px" id="sh-stats-note"></div>
         </div>
@@ -654,7 +860,7 @@ function injectHelperPage() {
           <div class="sh-card" style="text-align:center;padding:32px;">
             <div style="font-size:48px;margin-bottom:12px;">⭐</div>
             <div style="font-size:20px;font-weight:700;margin-bottom:6px;">Starvell Helper</div>
-            <div style="color:#8888aa;font-size:13px;margin-bottom:20px;">Версия 2.0.0 · Инструменты продавца</div>
+            <div style="color:#8888aa;font-size:13px;margin-bottom:20px;">Версия 2.1.1 · Инструменты продавца</div>
             <div style="color:#c8c8e8;font-size:13px;line-height:1.7;max-width:440px;margin:0 auto;">
               Расширение автоматизирует рутинные действия на <b>starvell.com</b>:<br>
               автоподнятие лотов через API и кастомный фон страниц.<br><br>
@@ -677,12 +883,13 @@ function injectHelperPage() {
       const tab = document.getElementById('sh-tab-' + item.dataset.tab);
       if (tab) tab.classList.add('active');
       if (item.dataset.tab === 'log') renderLog(document.getElementById('sh-log-list'));
+      if (item.dataset.tab === 'tickets') initTicketsTab();
     });
   });
 
   // ── Загружаем настройки ──────────────────────────────
   chrome.storage.local.get(
-    ['autoBoost', 'boostInterval', 'customBg', 'bgUrl', 'bgOpacity', 'lastBumpPayload', 'shNotifications', 'shStatTotal', 'shStatErrors'],
+    ['autoBoost', 'boostInterval', 'customBg', 'bgUrl', 'bgOpacity', 'lastBumpPayload', 'shNotifications', 'shStatTotal', 'shStatErrors', 'autoTicket', 'ticketPeriod', 'ticketLastSent'],
     (data) => {
       const boostToggle = document.getElementById('sh-auto-boost-toggle');
       const intervalSel = document.getElementById('sh-boost-interval');
@@ -705,6 +912,9 @@ function injectHelperPage() {
 
       document.getElementById('sh-stat-total').textContent  = data.shStatTotal  || 0;
       document.getElementById('sh-stat-errors').textContent = data.shStatErrors || 0;
+
+      // Автотикеты — инициализируем состояние и запускаем проверку расписания
+      if (data.autoTicket) scheduleTicketCheck();
     }
   );
 
@@ -761,6 +971,17 @@ function injectHelperPage() {
     const hint = document.getElementById('sh-boost-hint');
     if (hint) hint.style.display = hasPayload ? 'none' : 'block';
   }
+
+  // После загрузки настроек, можно показать количество лотов (асинхронно)
+  fetchAllActiveCategories().then(categories => {
+    const groups = groupByGame(categories);
+    const hint = document.getElementById('sh-boost-hint');
+    if (hint && categories.length) {
+      const totalCats = categories.length;
+      hint.innerHTML = `💡 Найдено категорий с лотами: ${totalCats} (${groups.length} игр). Автоподнятие поднимет всё.`;
+      hint.style.display = 'block';
+    }
+  }).catch(console.warn);
 
   // ── Фон ─────────────────────────────────────────────
   document.getElementById('sh-bg-opacity').addEventListener('input', () => {
@@ -830,8 +1051,9 @@ function injectHelperPage() {
 
   // ── Лог ─────────────────────────────────────────────
   document.getElementById('sh-clear-log-btn').addEventListener('click', () => {
-    boostLog.length = 0;
-    renderLog(document.getElementById('sh-log-list'));
+    chrome.storage.local.set({ shLog: [] }, () => {
+      renderLog(document.getElementById('sh-log-list'));
+    });
   });
 
   // ── Статистика ────────────────────────────────────────
@@ -860,6 +1082,7 @@ function injectHelperPage() {
       const walletDoc  = new DOMParser().parseFromString(walletHtml, 'text/html');
 
       let balance = 0;
+      let withdrawnTotal = 0;
 
       const walletNext = walletDoc.getElementById('__NEXT_DATA__');
       if (walletNext) {
@@ -875,12 +1098,16 @@ function injectHelperPage() {
         }
       }
 
+      const walletWithdrawHtml = await fetch('/wallet?type=withdrawal', { credentials: 'include' }).then(r => r.text());
+      const wdDoc = new DOMParser().parseFromString(walletWithdrawHtml, 'text/html');
+      withdrawnTotal = parseWalletWithdrawals(wdDoc);
 
       // ── 2. Продажи через POST /api/orders/list ────────
       const LIMIT = 20;
       let allOrders  = [];
       let offset     = 0;
       let hasMore    = true;
+      let batchCount = 0;
 
       // Первый батч всегда загружаем
       note.textContent = 'Загружаю заказы...';
@@ -888,6 +1115,7 @@ function injectHelperPage() {
       allOrders = firstBatch;
       offset   += firstBatch.length;
       hasMore   = firstBatch.length === LIMIT;
+      batchCount++;
 
       if (loadAll) {
         // Грузим все батчи до конца
@@ -898,6 +1126,7 @@ function injectHelperPage() {
           allOrders = allOrders.concat(batch);
           offset   += batch.length;
           hasMore   = batch.length === LIMIT;
+          batchCount++;
         }
       }
 
@@ -928,6 +1157,7 @@ function injectHelperPage() {
       const topGame = Object.entries(catMap).sort((a, b) => b[1] - a[1])[0];
 
       // Итого заработано = выводы + текущий баланс
+      const totalEarned = withdrawnTotal / 100 + balanceRub;
 
       // ── 4. Рендерим ───────────────────────────────────
       loading.style.display = 'none';
@@ -983,6 +1213,17 @@ function injectHelperPage() {
   }
 
   // Парсим сумму успешных выводов из DOM кошелька
+  function parseWalletWithdrawals(doc) {
+    let total = 0;
+    // Ищем строки с суммами (h5 внутри wallet_amount)
+    const amountEls = doc.querySelectorAll('[class*="wallet_amount"] h5, [class*="wallet_cell_amount"] h5');
+    amountEls.forEach(el => {
+      const txt = el.textContent.replace(/\s/g, '').replace(',', '.');
+      const val = parseFloat(txt.replace(/[^\d.]/g, ''));
+      if (!isNaN(val)) total += Math.round(val * 100);
+    });
+    return total;
+  }
 
   function fmt(n) {
     return n.toLocaleString('ru-RU', { maximumFractionDigits: 2, minimumFractionDigits: 0 });
@@ -995,6 +1236,200 @@ function injectHelperPage() {
     el.className = 'sh-feedback ' + type;
     clearTimeout(el._t);
     el._t = setTimeout(() => { el.className = 'sh-feedback'; }, 5000);
+  }
+
+  // =====================================================
+  //  АВТОТИКЕТЫ
+  // =====================================================
+
+  function initTicketsTab() {
+    chrome.storage.local.get(['autoTicket', 'ticketPeriod', 'ticketLastSent'], (data) => {
+      const toggle = document.getElementById('sh-ticket-toggle');
+      const period = document.getElementById('sh-ticket-period');
+      if (!toggle) return;
+
+      toggle.checked = !!data.autoTicket;
+      if (data.ticketPeriod) period.value = data.ticketPeriod;
+      updateTicketStatus(!!data.autoTicket, data.ticketLastSent);
+    });
+
+    document.getElementById('sh-ticket-toggle').addEventListener('change', () => {
+      const enabled = document.getElementById('sh-ticket-toggle').checked;
+      const period  = parseInt(document.getElementById('sh-ticket-period').value);
+      chrome.storage.local.set({ autoTicket: enabled, ticketPeriod: period });
+      updateTicketStatus(enabled, null);
+      if (enabled) scheduleTicketCheck();
+    });
+
+    document.getElementById('sh-ticket-period').addEventListener('change', () => {
+      const period = parseInt(document.getElementById('sh-ticket-period').value);
+      chrome.storage.local.set({ ticketPeriod: period });
+    });
+
+    document.getElementById('sh-ticket-now-btn').addEventListener('click', async () => {
+      const btn = document.getElementById('sh-ticket-now-btn');
+      btn.disabled = true;
+      btn.textContent = '⏳ Отправляю...';
+      await sendAutoTicket(true);
+      btn.disabled = false;
+      btn.textContent = '🎫 Отправить тикет сейчас';
+    });
+  }
+
+  function updateTicketStatus(enabled, lastSent) {
+    const statusEl = document.getElementById('sh-ticket-status');
+    const lastEl   = document.getElementById('sh-ticket-last');
+    if (!statusEl) return;
+    statusEl.textContent = enabled ? 'Статус: ✅ включено (проверка раз в сутки)' : 'Статус: выключено';
+    statusEl.style.color = enabled ? '#7cf' : '#8888aa';
+    if (lastEl) {
+      lastEl.textContent = lastSent
+        ? '🕐 Последний тикет: ' + new Date(lastSent).toLocaleString('ru-RU')
+        : '';
+    }
+  }
+
+  // Запускаем проверку расписания — раз при открытии дашборда
+  function scheduleTicketCheck() {
+    chrome.storage.local.get(['autoTicket', 'ticketPeriod', 'ticketLastSent'], async (data) => {
+      if (!data.autoTicket) return;
+      const period   = (data.ticketPeriod || 7) * 24 * 60 * 60 * 1000;
+      const lastSent = data.ticketLastSent || 0;
+      const now      = Date.now();
+      // Допуск ±10% от периода (но не более 23ч)
+      const tolerance = Math.min(period * 0.1, 23 * 60 * 60 * 1000);
+      if (now - lastSent >= period - tolerance) {
+        await sendAutoTicket(false);
+      }
+    });
+  }
+
+  async function sendAutoTicket(manual) {
+    const logEl = document.getElementById('sh-ticket-log');
+    const fbEl  = document.getElementById('sh-ticket-feedback');
+
+    function log(msg) {
+      addLog('🎫 ' + msg);
+      if (logEl) logEl.textContent = msg;
+    }
+
+    try {
+      log('Загружаю заказы продавца...');
+
+      const period = await new Promise(res =>
+        chrome.storage.local.get(['ticketPeriod'], d => res((d.ticketPeriod || 7)))
+      );
+      const thresholdMs = period * 24 * 60 * 60 * 1000;
+      const now = Date.now();
+
+      // Реальный контракт: POST /api/orders/list с телом {filter:{userType:"seller"}}.
+      // Сервер отдаёт список; статус и дату фильтруем сами.
+      const resp = await originalFetch('/api/orders/list', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ filter: { userType: 'seller' } })
+      });
+      if (!resp.ok) throw new Error('/api/orders/list вернул ' + resp.status);
+
+      const raw = await resp.json();
+      const allOrders = Array.isArray(raw) ? raw : (raw.orders || raw.data || raw.items || []);
+
+      // Берём только неподтверждённые (CREATED) и старше порога.
+      const getCreated = (o) => o.createdAt || o.created_at || o.date || o.createdDate;
+      const pending = allOrders.filter(o => {
+        const status = (o.status || o.orderStatus || '').toString().toUpperCase();
+        if (status !== 'CREATED') return false;
+        const ts = new Date(getCreated(o)).getTime();
+        if (!ts) return false;
+        return (now - ts) >= thresholdMs;
+      });
+
+      if (pending.length === 0) {
+        log(`Нет CREATED-заказов старше ${period} дн. — тикет не нужен`);
+        if (fbEl) { fbEl.textContent = '✅ Неподтверждённых заказов нет'; fbEl.className = 'sh-feedback ok'; fbEl.style.display = 'block'; }
+        return;
+      }
+
+      // Короткий ID заказа: последний сегмент UUID → последние 8 символов, заглавными.
+      const shortId = (o) => '#' + String(o.id).split('-').pop().slice(-8).toUpperCase();
+
+      // Группируем по ДНЮ создания (локальная дата YYYY-MM-DD).
+      // Каждый день, которому исполнилось >= period дней, уходит отдельным тикетом.
+      const dayKey = (o) => {
+        const d = new Date(getCreated(o));
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+      };
+      const groups = new Map();
+      for (const o of pending) {
+        const k = dayKey(o);
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(o);
+      }
+
+      log(`Найдено ${pending.length} заказов в ${groups.size} дн. — отправляю тикеты...`);
+
+      let sentTickets = 0;
+      let lastTicketId = '?';
+
+      for (const [day, orders] of groups) {
+        const ids = orders.map(shortId);
+        const ticketId = await createTicket(ids, orders.length, day);
+        if (ticketId) { sentTickets++; lastTicketId = ticketId; }
+        await sleep(1500); // пауза между тикетами
+      }
+
+      const sentAt = Date.now();
+      chrome.storage.local.set({ ticketLastSent: sentAt });
+      updateTicketStatus(true, sentAt);
+
+      log(`✅ Отправлено тикетов: ${sentTickets} (последний #${lastTicketId})`);
+      if (fbEl) {
+        fbEl.textContent = `✅ Отправлено тикетов: ${sentTickets} по ${pending.length} заказам`;
+        fbEl.className = 'sh-feedback ok';
+        fbEl.style.display = 'block';
+      }
+      if (!manual) {
+        chrome.runtime.sendMessage({ type: 'SHOW_NOTIFICATION', text: `Автотикеты: ${sentTickets} шт (${pending.length} заказов)` });
+      }
+
+    } catch (e) {
+      log('❌ Ошибка: ' + e.message);
+      if (fbEl) {
+        fbEl.textContent = '❌ ' + e.message;
+        fbEl.className = 'sh-feedback err';
+        fbEl.style.display = 'block';
+      }
+      console.error('[Starvell Helper Tickets]', e);
+    }
+  }
+
+  // Создание одного тикета через multipart/form-data (реальный контракт сайта).
+  async function createTicket(shortIds, count, dayLabel) {
+    const listHtml = shortIds.map(id => `<li>Заказ ${id}</li>`).join('');
+    const description =
+      `<p>Здравствуйте, покупатели забыли подтвердить заказы в кол-ве ${count} шт` +
+      (dayLabel ? ` (от ${dayLabel})` : '') + `:</p>` +
+      `<ul>${listHtml}</ul>` +
+      `<p>Там где не требуются доказательства (аренда или прочее), если на некоторые заказы нужны доказательства, напишите в тикет, при спорных моментах можно подключить поддержку (арбитраж)</p>` +
+      `<p>Реализация автотикет в расширении starvell-helper (пробный)</p>`;
+
+    // ВАЖНО: сервер ждёт form-data, а не JSON. orderId — короткие ID через запятую.
+    const fd = new FormData();
+    fd.append('ticketType', '1');
+    fd.append('subject', 'Покупатель забыл подтвердить заказ');
+    fd.append('description', description);
+    fd.append('orderId', shortIds.join(', '));
+    fd.append('orderUserTypeId', '2');   // 2 = продавец
+    fd.append('orderTopicId', '501');    // 501 = "покупатель забыл подтвердить"
+
+    const resp = await originalFetch('/api/support/create', {
+      method: 'POST',
+      credentials: 'include',
+      body: fd  // Content-Type выставит браузер сам (с boundary)
+    });
+    if (!resp.ok) throw new Error('create вернул ' + resp.status);
+    const result = await resp.json();
+    return result.id || result.ticketId || '?';
   }
 }
 
@@ -1110,3 +1545,5 @@ if (location.pathname !== '/starvell-helper') {
     waitForNavbar();
   }
 }
+
+//доработать автотикет систему получить свежие запросы в https://starvell.com/support/new

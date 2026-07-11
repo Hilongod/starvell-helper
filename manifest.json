@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Starvell Helper",
-  "version": "2.0.0",
-  "description": "Автоподнятие лотов и кастомный фон для Starvell",
+  "version": "2.1.1",
+  "description": "Автоподнятие всех лотов, автотикеты в поддержку, статистика продаж и кастомный фон для Starvell",
 
   "permissions": [
     "storage",

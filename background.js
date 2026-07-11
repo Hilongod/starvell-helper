@@ -1,3 +1,4 @@
+// ===== Starell Helper BG — BUILD 2026-07-05-fix6 =====
 // =====================================================
 //  Starvell Helper — background.js (Service Worker)
 // =====================================================
@@ -44,16 +45,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-// Alarm срабатывает — шлём BOOST_NOW на все вкладки Starvell
+// Alarm срабатывает — шлём BOOST_NOW ТОЛЬКО НА ОДНУ вкладку Starvell.
+// Раньше слали на все открытые вкладки → каждая делала свой bump → 429.
+// Теперь поднятие происходит один раз за тик, независимо от числа вкладок.
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'starvell-boost') {
     chrome.storage.local.get(['autoBoost'], (data) => {
       if (!data.autoBoost) return;
 
       chrome.tabs.query({ url: 'https://starvell.com/*' }, (tabs) => {
-        for (const tab of tabs) {
-          chrome.tabs.sendMessage(tab.id, { type: 'BOOST_NOW' }).catch(() => {});
+        if (!tabs || tabs.length === 0) {
+          console.log('[Starvell Helper BG] Нет вкладок Starvell — пропускаю тик');
+          return;
         }
+        // Берём одну вкладку: приоритет активной, иначе первую попавшуюся.
+        const target = tabs.find(t => t.active) || tabs[0];
+        chrome.tabs.sendMessage(target.id, { type: 'BOOST_NOW' })
+          .then(resp => console.log('[Starvell Helper BG] BOOST_NOW отправлен, ответ:', resp))
+          .catch(() => {
+            // Вкладка не ответила (например, дашборд) — пробуем следующую
+            const fallback = tabs.find(t => t.id !== target.id);
+            if (fallback) chrome.tabs.sendMessage(fallback.id, { type: 'BOOST_NOW' }).catch(() => {});
+          });
       });
     });
   }
@@ -61,6 +74,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // Восстанавливаем alarm после перезапуска браузера / обновления расширения
 chrome.runtime.onStartup.addListener(() => {
+  // Очищаем лог событий — новая сессия браузера
+  chrome.storage.local.remove('shLog');
+  console.log('[Starvell Helper BG] Лог событий очищен (новая сессия)');
+
   chrome.storage.local.get(['autoBoost', 'boostInterval'], (data) => {
     if (data.autoBoost) {
       chrome.alarms.create('starvell-boost', {
