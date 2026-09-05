@@ -1,7 +1,105 @@
-// ===== Starell Helper BG — BUILD 2026-07-05-fix6 =====
 // =====================================================
-//  Starvell Helper — background.js (Service Worker)
+//  Starvell Helper — background.js (Service Worker, MV3)
 // =====================================================
+
+// =====================================================
+//  КЕШ НАСТРОЕК ЗВУКОВ + РАННИЙ ИНЖЕКТ В MAIN WORLD
+// =====================================================
+
+let soundSettingsCache = { message: 'default', purchase: 'default' };
+
+// Загружаем кеш при старте service worker
+chrome.storage.local.get(['shSoundMsg', 'shSoundOrder'], (data) => {
+  soundSettingsCache.message = data.shSoundMsg || 'default';
+  soundSettingsCache.purchase = data.shSoundOrder || 'default';
+});
+
+// Обновляем кеш при изменении настроек
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes.shSoundMsg) soundSettingsCache.message = changes.shSoundMsg.newValue;
+  if (changes.shSoundOrder) soundSettingsCache.purchase = changes.shSoundOrder.newValue;
+});
+
+// Инжектим перехват fetch ПЕРЕД загрузкой скриптов Starvell
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'loading') return;
+
+  const settings = { ...soundSettingsCache };
+  const extId = chrome.runtime.id;
+
+  chrome.scripting.executeScript({
+    target: { tabId },
+    func: (settings, extId) => {
+      if (window.__shSoundHook) return;
+      if (!location.href.startsWith('https://starvell.com')) return;
+
+      window.__shSoundHook = true;
+      window.__shSoundSettings = settings;
+
+      const MAP = {
+        message: {
+          custom1: `chrome-extension://${extId}/sounds/msg1.mp3`,
+          custom2: `chrome-extension://${extId}/sounds/msg2.mp3`,
+          custom3: `chrome-extension://${extId}/sounds/msg3.mp3`
+        },
+        purchase: {
+          custom1: `chrome-extension://${extId}/sounds/order1.mp3`,
+          custom2: `chrome-extension://${extId}/sounds/order2.mp3`,
+          custom3: `chrome-extension://${extId}/sounds/order3.mp3`
+        }
+      };
+
+      const origFetch = window.fetch;
+      window.fetch = async function(...args) {
+        let reqUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+        if (!reqUrl) return origFetch.apply(this, args);
+
+        let type = null;
+        if (reqUrl.includes('/sounds/message.mp3')) type = 'message';
+        else if (reqUrl.includes('/sounds/purchase.mp3')) type = 'purchase';
+
+        if (type) {
+          const mode = window.__shSoundSettings?.[type] ?? settings[type];
+          if (mode === 'mute') {
+            const silence = Uint8Array.from(atob('UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA='), c => c.charCodeAt(0));
+            return new Response(new Blob([silence], {type:'audio/wav'}), {status:200});
+          }
+          const custom = MAP[type]?.[mode];
+          if (custom) {
+            if (typeof args[0] === 'string') {
+              args[0] = custom;
+            } else {
+              const req = args[0];
+              args[0] = new Request(custom, {
+                method: req.method,
+                headers: req.headers,
+                body: req.body,
+                mode: req.mode,
+                credentials: req.credentials,
+                cache: req.cache,
+                redirect: req.redirect,
+                referrer: req.referrer,
+                integrity: req.integrity
+              });
+            }
+          }
+        }
+        return origFetch.apply(this, args);
+      };
+
+      window.addEventListener('message', function(e){
+        if (e.source !== window) return;
+        if (e.data?.source === 'starvell-helper-sounds' && e.data.settings) {
+          Object.assign(window.__shSoundSettings, e.data.settings);
+        }
+      });
+    },
+    args: [settings, extId],
+    world: 'MAIN',
+    injectImmediately: true
+  }).catch(() => {});
+});
 
 // Клик по иконке расширения → открываем /starvell-helper
 chrome.action.onClicked.addListener(() => {
@@ -43,10 +141,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       console.log('[Starvell Helper BG] Alarm удалён');
     }
   }
+
+  // Отдаём session cookie content script'у (HttpOnly, только background может прочитать)
+  if (msg.type === 'GET_SESSION_COOKIE') {
+    chrome.cookies.get({ url: 'https://starvell.com', name: 'session' }, (cookie) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ success: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      if (cookie && cookie.value) {
+        sendResponse({ success: true, value: cookie.value });
+        return;
+      }
+      // Fallback: ищем по домену
+      chrome.cookies.getAll({ domain: 'starvell.com' }, (cookies) => {
+        if (chrome.runtime.lastError) {
+          sendResponse({ success: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        const found = cookies.find(c => c.name === 'session' && c.value.length > 20);
+        sendResponse({ success: !!found, value: found?.value || null });
+      });
+    });
+    return true;
+  }
+
 });
 
-// Alarm срабатывает — шлём BOOST_NOW ТОЛЬКО НА ОДНУ вкладку Starvell.
-// Раньше слали на все открытые вкладки → каждая делала свой bump → 429.
 // Теперь поднятие происходит один раз за тик, независимо от числа вкладок.
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'starvell-boost') {
