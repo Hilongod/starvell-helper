@@ -2,117 +2,76 @@
 //  Starvell Helper — content/03-ui-extras.js
 // =====================================================
 
-// =====================================================
-// ФУНКЦИЯ 4 — Кнопка «S» в навбаре → открывает дашборд ───
-// =====================================================
-const NAV_BTN_ID   = 'starvell-helper-nav-btn';
-const NAV_STYLE_ID = 'starvell-helper-nav-style';
+// Кнопка находится в собственном узле вне #__next. Заголовок React только читается.
+const NAV_BTN_ID = 'starvell-helper-nav-btn';
+const NAV_HOST_ID = 'starvell-helper-nav-host';
+let navbarFrame = null;
+
+function positionNavbarButton(host) {
+  const rightZone = document.querySelector('[class*="header_user_nav_main"]')
+    || document.querySelector('[class*="header_user_nav__"]');
+  const rect = rightZone?.getBoundingClientRect();
+  if (rect && rect.left >= 50 && rect.bottom > 0 && rect.top < window.innerHeight) {
+    host.style.left = `${Math.min(window.innerWidth - 42, Math.max(8, Math.round(rect.left - 42)))}px`;
+    host.style.top = `${Math.max(8, Math.round(rect.top + (rect.height - 34) / 2))}px`;
+    host.style.right = 'auto'; host.style.bottom = 'auto';
+  } else {
+    // В узком/новом навбаре оставляем доступную кнопку без изменения разметки сайта.
+    host.style.left = 'auto'; host.style.top = 'auto'; host.style.right = '16px'; host.style.bottom = '16px';
+  }
+}
 
 function injectNavbarButton() {
-  if (document.getElementById(NAV_BTN_ID)) return;
-
-  const rightZone =
-    document.querySelector('[class*="header_user_nav_main"]') ||
-    document.querySelector('[class*="header_user_nav__"]')    ||
-    document.querySelector('[class*="header_inner_"]')        ||
-    document.querySelector('header');
-
-  if (!rightZone) {
-    console.warn('[Starvell Helper] Навбар не найден, повторим позже');
-    return;
-  }
-
-  if (!document.getElementById(NAV_STYLE_ID)) {
+  if (!document.body) return;
+  let host = document.getElementById(NAV_HOST_ID);
+  if (!host) {
+    host = document.createElement('div');
+    host.id = NAV_HOST_ID;
+    host.style.cssText = 'position:fixed;width:34px;height:34px;z-index:2147483646;pointer-events:none;';
+    const shadow = host.attachShadow({ mode: 'open' });
     const style = document.createElement('style');
-    style.id = NAV_STYLE_ID;
     style.textContent = `
-      [class*="header_user_nav_main"],
-      [class*="header_user_nav__"],
-      [class*="header_inner_"] { align-items: center !important; }
-
-      #${NAV_BTN_ID} {
-        display: inline-flex; align-items: center; justify-content: center;
-        width: 34px; height: 34px; min-width: 34px; min-height: 34px;
-        border-radius: 9px;
-        background: linear-gradient(135deg, #7c5cfc, #5a3fd0);
-        color: #fff; font-size: 16px; font-weight: 800;
-        font-family: 'Segoe UI', system-ui, sans-serif;
-        letter-spacing: -0.5px; cursor: pointer;
-        border: none; outline: none;
-        box-shadow: 0 2px 8px rgba(124,92,252,0.45);
-        transition: filter 0.18s, transform 0.15s, box-shadow 0.18s;
-        flex-shrink: 0; align-self: center; position: relative;
-        user-select: none; vertical-align: middle; line-height: 1;
-        padding: 0; margin: 0 4px 0 0; text-decoration: none;
+      :host { all: initial; }
+      button {
+        display:block; width:34px; height:34px; border-radius:9px;
+        background:linear-gradient(135deg,#7c5cfc,#5a3fd0); color:#fff;
+        font:800 16px 'Segoe UI',system-ui,sans-serif; border:0; padding:0;
+        cursor:pointer; pointer-events:auto; box-shadow:0 2px 8px rgba(124,92,252,.45);
       }
-      #${NAV_BTN_ID}:hover {
-        filter: brightness(1.18); transform: translateY(-1px);
-        box-shadow: 0 4px 16px rgba(124,92,252,0.6);
-      }
-      #${NAV_BTN_ID}:active { transform: translateY(0); filter: brightness(0.95); }
-      #${NAV_BTN_ID}::after {
-        content: 'Starvell Helper';
-        position: absolute; bottom: -30px; left: 50%; transform: translateX(-50%);
-        background: #1a1a28; color: #e8e8f0; font-size: 11px; font-weight: 500;
-        white-space: nowrap; border-radius: 5px; padding: 4px 8px;
-        pointer-events: none; opacity: 0; transition: opacity 0.15s;
-        border: 1px solid #2a2845;
-      }
-      #${NAV_BTN_ID}:hover::after { opacity: 1; }
+      button:hover { filter:brightness(1.18); }
+      button:focus-visible { outline:2px solid #c8b8ff; outline-offset:3px; }
     `;
-    document.head.appendChild(style);
+    const button = document.createElement('button');
+    button.id = NAV_BTN_ID; button.type = 'button'; button.title = 'Starvell Helper — открыть дашборд';
+    button.setAttribute('aria-label', 'Открыть Starvell Helper'); button.textContent = 'S';
+    button.addEventListener('click', event => { event.stopPropagation(); location.href = 'https://starvell.com/starvell-helper'; });
+    shadow.appendChild(style); shadow.appendChild(button);
+    document.body.appendChild(host);
+    console.log('[Starvell Helper] Кнопка S добавлена вне разметки React');
   }
-
-  const wrapper = document.createElement('span');
-  wrapper.style.cssText = 'display: contents;';
-
-  const btn = document.createElement('button');
-  btn.id = NAV_BTN_ID;
-  btn.title = 'Starvell Helper — открыть дашборд';
-  btn.textContent = 'S';
-  wrapper.appendChild(btn);
-
-  // ── Клик → переходим на /starvell-helper в этой же вкладке
-  btn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    location.href = 'https://starvell.com/starvell-helper';
-  });
-
-  const firstNavItem =
-    rightZone.querySelector('[class*="header_user_nav_item"]') ||
-    rightZone.querySelector('a');
-
-  if (firstNavItem) {
-    rightZone.insertBefore(wrapper, firstNavItem);
-  } else {
-    rightZone.appendChild(wrapper);
-  }
-
-  console.log('[Starvell Helper] Кнопка добавлена в навбар');
+  positionNavbarButton(host);
 }
 
-// ── MutationObserver + polling ───────────────────────
+function queueNavbarPosition() {
+  if (navbarFrame !== null) return;
+  navbarFrame = requestAnimationFrame(() => { navbarFrame = null; injectNavbarButton(); });
+}
+
 function waitForNavbar() {
   injectNavbarButton();
-  const observer = new MutationObserver(() => {
-    if (!document.getElementById(NAV_BTN_ID)) injectNavbarButton();
-  });
-  observer.observe(document.documentElement, { childList: true, subtree: true });
-  let attempts = 0;
-  const poll = setInterval(() => {
-    if (document.getElementById(NAV_BTN_ID) || ++attempts > 30) { clearInterval(poll); return; }
-    injectNavbarButton();
-  }, 500);
+  const observer = new MutationObserver(queueNavbarPosition);
+  observer.observe(document.body, { childList: true, subtree: true });
+  window.addEventListener('resize', queueNavbarPosition, { passive: true });
+  window.addEventListener('scroll', queueNavbarPosition, { passive: true, capture: true });
 }
 
-// Навбар не нужен на странице дашборда
-if (location.pathname !== '/starvell-helper') {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', waitForNavbar);
-  } else {
-    waitForNavbar();
-  }
+function afterPageLoad(action) {
+  const run = () => requestAnimationFrame(() => requestAnimationFrame(action));
+  if (document.readyState === 'complete') run();
+  else window.addEventListener('load', run, { once: true });
 }
+
+if (location.pathname !== '/starvell-helper') afterPageLoad(waitForNavbar);
 
 // =====================================================
 //  ФУНКЦИЯ 5 — GLOW: свечение только крупных блоков
@@ -229,10 +188,4 @@ function removeGlow() {
 // =====================================================
 //  Открытие дашборда — /starvell-helper
 // =====================================================
-if (location.pathname === '/starvell-helper') {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => injectHelperPage());
-  } else {
-    injectHelperPage();
-  }
-}
+if (location.pathname === '/starvell-helper') afterPageLoad(injectHelperPage);

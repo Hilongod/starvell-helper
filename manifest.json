@@ -1,9 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Starvell Helper",
-  "version": "2.1.3",
+  "version": "2.1.4",
   "description": "Автоподнятие лотов, автотикеты в поддержку, статистика продаж, кастомный фон и многое другое для Starvell",
-
   "permissions": [
     "storage",
     "alarms",
@@ -11,21 +10,22 @@
     "cookies",
     "scripting"
   ],
-
   "host_permissions": [
     "https://starvell.com/*",
     "https://*.starvell.com/*"
   ],
-
   "background": {
     "service_worker": "background.js"
   },
-
   "content_scripts": [
     {
-      "matches": ["https://starvell.com/*"],
-      "css": ["content.css"],
-      "run_at": "document_start",
+      "matches": [
+        "https://starvell.com/*"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle",
       "js": [
         "content/01-core.js",
         "content/02-dashboard.js",
@@ -33,14 +33,16 @@
       ]
     }
   ],
-
   "web_accessible_resources": [
     {
-      "resources": ["sounds/*"],
-      "matches": ["https://starvell.com/*"]
+      "resources": [
+        "sounds/*"
+      ],
+      "matches": [
+        "https://starvell.com/*"
+      ]
     }
   ],
-
   "action": {
     "default_icon": {
       "16": "icons/icon16.png",

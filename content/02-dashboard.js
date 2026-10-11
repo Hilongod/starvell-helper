@@ -3,10 +3,11 @@
 // =====================================================
 
 function injectHelperPage() {
-  document.body.style.display = 'none';
+  if (document.getElementById('sh-page')) return;
 
   const style = document.createElement('style');
   style.textContent = `
+    body > :not(#sh-page):not(script):not(style) { display: none !important; }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     #sh-page {
       display: flex; flex-direction: column; min-height: 100vh;
@@ -218,7 +219,7 @@ function injectHelperPage() {
         <div class="sh-tab active" id="sh-tab-boost">
           <div class="sh-page-header">
             <div class="sh-page-title">🚀 Автоподнятие лотов</div>
-            <div class="sh-page-sub">Автоматически нажимает «Поднять» через API с нужным интервалом</div>
+            <div class="sh-page-sub">Адаптивное автоподнятие предложений + система обновления профиля раз в 30 мин короч</div>
           </div>
           <div class="sh-stats">
             <div class="sh-stat"><div class="sh-stat-val" id="sh-stat-total">0</div><div class="sh-stat-lbl">Поднятий всего</div></div>
@@ -236,7 +237,7 @@ function injectHelperPage() {
             <div class="sh-toggle-row">
               <div>
                 <div class="sh-toggle-label">Включить автоподнятие</div>
-                <div class="sh-toggle-desc">Автоматически поднимает все лоты с заданным интервалом</div>
+                <div class="sh-toggle-desc">Проверяет новые предложения раз в 30 минут; поднимает по срокам игр с минутой запаса</div>
               </div>
               <label class="sh-switch">
                 <input type="checkbox" id="sh-auto-boost-toggle" />
@@ -244,13 +245,13 @@ function injectHelperPage() {
               </label>
             </div>
             <div class="sh-field-row">
-              <label>Интервал подъёма</label>
+              <label>Интервал подъёма (+1 мин запаса)</label>
               <select class="sh-select" id="sh-boost-interval">
                 <option value="10">10 минут</option>
                 <option value="15">15 минут</option>
-                <option value="30" selected>30 минут</option>
+                <option value="30">30 минут</option>
                 <option value="60">1 час</option>
-                <option value="120">2 часа</option>
+                <option value="120" selected>2 часа</option>
                 <option value="240">4 часа</option>
               </select>
             </div>
@@ -265,7 +266,7 @@ function injectHelperPage() {
         <div class="sh-tab" id="sh-tab-bg">
           <div class="sh-page-header">
             <div class="sh-page-title">🎨 Кастомный фон</div>
-            <div class="sh-page-sub">Установи своё фоновое изображение на starvell.com</div>
+            <div class="sh-page-sub">Установи своё фоновое изображение или выбери ниже из представленных на starvell.com</div>
           </div>
           <div class="sh-card">
             <div class="sh-card-title">Управление фоном</div>
@@ -585,7 +586,7 @@ function injectHelperPage() {
       </main>
     </div>
   `;
-  document.documentElement.appendChild(page);
+  document.body.appendChild(page);
   document.getElementById('sh-topbar-badge').textContent = 'v' + SH_VERSION;
   document.getElementById('sh-about-version').textContent = 'Версия ' + SH_VERSION + ' · Инструменты продавца';
 
@@ -639,15 +640,20 @@ function injectHelperPage() {
     });
   });
 
+  let sessionCount = 0;
+  let lastSeenRunId = null;
+  let boostState = {};
+
   // ── Загружаем настройки ──────────────────────────────
   chrome.storage.local.get(
-    ['autoBoost', 'boostInterval', 'customBg', 'bgUrl', 'bgOpacity', 'shNotifications', 'shStatTotal', 'shStatErrors', 'autoTicket', 'ticketPeriod', 'ticketLastSent', 'ticketCustomTemplate'],
+    ['autoBoost', 'boostInterval', 'shBoostNextAt', 'shBoostNextBumpAt', 'shBoostCatalog', 'shBoostRun', 'shBoostLastResult', 'customBg', 'bgUrl', 'bgOpacity', 'shNotifications', 'shStatTotal', 'shStatErrors', 'autoTicket', 'ticketPeriod', 'ticketLastSent', 'ticketCustomTemplate'],
     (data) => {
       const boostToggle = document.getElementById('sh-auto-boost-toggle');
       const intervalSel = document.getElementById('sh-boost-interval');
       boostToggle.checked = !!data.autoBoost;
       if (data.boostInterval) intervalSel.value = data.boostInterval;
-      updateBoostStatus(!!data.autoBoost, intervalSel.value);
+      lastSeenRunId = data.shBoostLastResult?.runId || lastSeenRunId;
+      renderBoostState(data);
 
       document.getElementById('sh-bg-toggle').checked = !!data.customBg;
       if (data.bgUrl) {
@@ -673,69 +679,117 @@ function injectHelperPage() {
     }
   );
 
-  // ── Автоподнятие toggle ──────────────────────────────
-  document.getElementById('sh-auto-boost-toggle').addEventListener('change', () => {
-    const enabled  = document.getElementById('sh-auto-boost-toggle').checked;
-    const interval = parseInt(document.getElementById('sh-boost-interval').value);
-    chrome.storage.local.set({ autoBoost: enabled, boostInterval: interval });
-    chrome.runtime.sendMessage({ type: 'TOGGLE_AUTO_BOOST', enabled, interval });
-    updateBoostStatus(enabled, interval);
-    shFeedback('sh-boost-feedback', enabled ? `✓ Включено (каждые ${interval} мин)` : '✓ Выключено', 'ok');
-  });
+  // ── Автоподнятие: единый background-планировщик ──────
 
-  document.getElementById('sh-boost-interval').addEventListener('change', () => {
-    const interval = parseInt(document.getElementById('sh-boost-interval').value);
-    chrome.storage.local.set({ boostInterval: interval });
-    if (document.getElementById('sh-auto-boost-toggle').checked) {
-      chrome.runtime.sendMessage({ type: 'TOGGLE_AUTO_BOOST', enabled: true, interval });
-      updateBoostStatus(true, interval);
-    }
-  });
-
-  // ── Поднять сейчас ───────────────────────────────────
-  let sessionCount = 0, sessionErrors = 0;
-  document.getElementById('sh-boost-now-btn').addEventListener('click', async () => {
-    const btn = document.getElementById('sh-boost-now-btn');
-    btn.disabled = true; btn.textContent = '⏳ Поднимаю...';
-    const result = await boostAllLots();
-    if (result.rateLimit) {
-      shFeedback('sh-boost-feedback', '⚠ Rate limit — увеличь интервал до 60+ мин', 'err');
-      sessionErrors++;
-    } else if (result.count > 0) {
-      shFeedback('sh-boost-feedback', '✓ Лоты подняты!', 'ok');
-      sessionCount++;
-    } else {
-      shFeedback('sh-boost-feedback', '⚠ Активных лотов не найдено — открой свою страницу профиля и попробуй снова', 'err');
-      sessionErrors++;
-    }
-    document.getElementById('sh-stat-session').textContent = sessionCount;
-    chrome.storage.local.get(['shStatTotal', 'shStatErrors'], d => {
-      const total  = (d.shStatTotal  || 0) + result.count;
-      const errors = (d.shStatErrors || 0) + (result.failed || 0);
-      chrome.storage.local.set({ shStatTotal: total, shStatErrors: errors });
-      document.getElementById('sh-stat-total').textContent  = total;
-      document.getElementById('sh-stat-errors').textContent = errors;
-    });
-    btn.disabled = false; btn.textContent = '⬆ Поднять сейчас';
-  });
-
-  function updateBoostStatus(active, interval) {
-    document.getElementById('sh-boost-dot').className = 'sh-dot ' + (active ? 'active' : 'inactive');
-    document.getElementById('sh-boost-status-text').textContent = active
-      ? `Активно — каждые ${interval} мин` : 'Автоподнятие выключено';
-    // Подсказку с числом найденных лотов показывает fetchAllActiveCategories() ниже
+  function formatBoostCountdown(seconds) {
+    const total = Math.max(0, Math.ceil(seconds));
+    return `${String(Math.floor(total / 3600)).padStart(2, '0')}:${String(Math.floor(total / 60) % 60).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
   }
 
-  // После загрузки настроек, можно показать количество лотов (асинхронно)
+  function updateBoostStatus() {
+    const active = !!boostState.autoBoost;
+    const running = !!boostState.shBoostRun;
+    const dot = document.getElementById('sh-boost-dot');
+    const status = document.getElementById('sh-boost-status-text');
+    dot.className = 'sh-dot ' + (active || running ? 'active' : 'inactive');
+    if (running) status.textContent = 'Поднимаю лоты...';
+    else if (!active) status.textContent = 'Автоподнятие выключено';
+    else if (boostState.shBoostNextAt > Date.now()) {
+      const left = Math.ceil((boostState.shBoostNextAt - Date.now()) / 1000);
+      const bumpLeft = Math.max(0, Math.ceil(((boostState.shBoostNextBumpAt || Date.now()) - Date.now()) / 1000));
+      status.textContent = bumpLeft
+        ? `Поднятие через ${formatBoostCountdown(bumpLeft)} · проверка профиля через ${formatBoostCountdown(left)}`
+        : `Активно — проверка профиля через ${formatBoostCountdown(left)}`;
+    } else status.textContent = 'Активно — ожидаю запуска';
+  }
+
+  function renderBoostState(data) {
+    Object.assign(boostState, data);
+    document.getElementById('sh-auto-boost-toggle').checked = !!boostState.autoBoost;
+    if (boostState.boostInterval) document.getElementById('sh-boost-interval').value = String(boostState.boostInterval);
+    document.getElementById('sh-boost-now-btn').disabled = !!boostState.shBoostRun;
+    document.getElementById('sh-boost-now-btn').textContent = boostState.shBoostRun ? '⏳ Поднимаю...' : '⬆ Поднять сейчас';
+    document.getElementById('sh-stat-total').textContent = boostState.shStatTotal || 0;
+    document.getElementById('sh-stat-errors').textContent = boostState.shStatErrors || 0;
+    const catalog = boostState.shBoostCatalog;
+    const hint = document.getElementById('sh-boost-hint');
+    if (catalog && hint) {
+      hint.textContent = `Найдено: ${catalog.games.length} игр/сервисов, ${catalog.categories.length} категорий. Плановая проверка профиля раз в 30 минут; перед поднятием данные обновляются.`;
+      hint.style.display = 'block';
+    }
+    updateBoostStatus();
+  }
+
+  if (window._shBoostTimer) clearInterval(window._shBoostTimer);
+  window._shBoostTimer = setInterval(updateBoostStatus, 1000); // только текст, без POST
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !document.getElementById('sh-boost-status-text')) return;
+    const relevant = ['autoBoost', 'boostInterval', 'shBoostNextAt', 'shBoostNextBumpAt', 'shBoostCatalog', 'shBoostRun', 'shBoostLastResult', 'shStatTotal', 'shStatErrors'];
+    const data = {};
+    for (const key of relevant) if (changes[key]) data[key] = changes[key].newValue;
+    if (!Object.keys(data).length) return;
+    renderBoostState(data);
+    const result = changes.shBoostLastResult?.newValue;
+    if (result && result.runId !== lastSeenRunId) {
+      lastSeenRunId = result.runId;
+      sessionCount += result.count || 0;
+      document.getElementById('sh-stat-session').textContent = sessionCount;
+      shFeedback('sh-boost-feedback', result.message || 'Запуск завершён.', result.count ? 'ok' : result.failed ? 'err' : 'ok');
+    }
+  });
+
+  document.getElementById('sh-auto-boost-toggle').addEventListener('change', async event => {
+    const toggle = event.target;
+    toggle.disabled = true;
+    try {
+      const interval = Number(document.getElementById('sh-boost-interval').value);
+      const result = await requestBackground({ type: 'TOGGLE_AUTO_BOOST', enabled: toggle.checked, interval });
+      shFeedback('sh-boost-feedback', result.error || (result.enabled ? '✓ Автоподнятие включено' : '✓ Автоподнятие выключено'), result.ok ? 'ok' : 'err');
+    } catch (error) {
+      shFeedback('sh-boost-feedback', error.message, 'err');
+    } finally {
+      renderBoostState(await chrome.storage.local.get(['autoBoost', 'boostInterval', 'shBoostRun', 'shBoostNextAt']));
+      toggle.disabled = false;
+    }
+  });
+
+  document.getElementById('sh-boost-interval').addEventListener('change', async event => {
+    try {
+      const result = await requestBackground({
+        type: 'TOGGLE_AUTO_BOOST', enabled: document.getElementById('sh-auto-boost-toggle').checked,
+        interval: Number(event.target.value)
+      });
+      if (!result.ok) throw new Error(result.error || 'Не удалось изменить интервал.');
+      shFeedback('sh-boost-feedback', '✓ Интервал сохранён. Cooldown сервера учитывается автоматически.', 'ok');
+    } catch (error) { shFeedback('sh-boost-feedback', error.message, 'err'); }
+  });
+
+  document.getElementById('sh-boost-now-btn').addEventListener('click', async () => {
+    const button = document.getElementById('sh-boost-now-btn');
+    button.disabled = true;
+    button.textContent = '⏳ Поднимаю...';
+    try {
+      const result = await requestBackground({ type: 'BOOST_REQUEST' });
+      if (!result.ok) throw new Error(result.error || 'Не удалось запустить поднятие.');
+      shFeedback('sh-boost-feedback', '⏳ Запуск принят, поднимаю лоты...', 'ok');
+    } catch (error) { shFeedback('sh-boost-feedback', error.message, 'err'); }
+    finally { renderBoostState(await chrome.storage.local.get(['shBoostRun', 'shBoostNextAt', 'autoBoost'])); }
+  });
+
   fetchAllActiveCategories().then(categories => {
     const groups = groupByGame(categories);
     const hint = document.getElementById('sh-boost-hint');
-    if (hint && categories.length) {
-      const totalCats = categories.length;
-      hint.innerHTML = `💡 Найдено категорий с лотами: ${totalCats} (${groups.length} игр). Автоподнятие поднимет всё.`;
+    if (hint) {
+      hint.textContent = categories.length
+        ? `💡 Найдено категорий с лотами: ${categories.length} (${groups.length} игр/сервисов). Профиль обновляется автоматически.`
+        : 'В твоём профиле нет активных лотов.';
       hint.style.display = 'block';
     }
-  }).catch(console.warn);
+  }).catch(error => {
+    const hint = document.getElementById('sh-boost-hint');
+    if (hint) { hint.textContent = error.message; hint.style.display = 'block'; }
+    console.warn('[Starvell Helper] Сканирование профиля:', error.message);
+  });
 
   // ── Фон ─────────────────────────────────────────────
   document.getElementById('sh-bg-opacity').addEventListener('input', () => {
@@ -1274,4 +1328,3 @@ function injectHelperPage() {
     shFeedback('sh-glow-feedback', '✓ Свечение убрано', 'ok');
   });
 }
-

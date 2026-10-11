@@ -3,47 +3,69 @@
 // =====================================================
 
 const SH_VERSION = (() => {
-  try { return chrome.runtime.getManifest().version; } catch(e) { return '2.1.3'; }
+  try { return chrome.runtime.getManifest().version; } catch(e) { return '2.1.4'; }
 })();
-console.log(`%c[Starvell Helper] v${SH_VERSION} загружен`,`color:#7c5cfc;font-weight:bold`);
+console.log(`%c[Starvell Helper] v${SH_VERSION} загружен`, 'color:#7c5cfc;font-weight:bold');
 
-// Обновление настроек "на лету" (без перезагрузки страницы)
 function pushSoundSettings(msg, order) {
-  window.postMessage({
-    source: 'starvell-helper-sounds',
-    settings: { message: msg, purchase: order }
-  }, '*');
+  window.postMessage({ source: 'starvell-helper-sounds', settings: { message: msg, purchase: order } }, '*');
 }
 
-let autoBoostInterval = null;
-let boostIntervalMs = 30 * 60 * 1000;
 let sessionKeyVisible = false;
 let currentSessionKey = '';
+let boostRunPromise = null;
+let homepageDataPromise = null;
+let refreshedBuildId = null;
+const originalFetch = window.fetch.bind(window);
+const BOOST_DISCOVERY_MS = 30 * 60 * 1000;
+const BOOST_SAFETY_MS = 60 * 1000;
+const BOOST_ERROR_RETRY_MS = 5 * 60 * 1000;
 
-// ─── Загружаем настройки при старте ─────────────────
-chrome.storage.local.get(['autoBoost', 'boostInterval', 'customBg', 'bgUrl', 'bgOpacity', 'glowEnabled', 'glowColor', 'glowIntensity'], (data) => {
-  if (data.autoBoost) startAutoBoost(data.boostInterval || 30);
-  if (data.customBg && data.bgUrl) applyBackground(data.bgUrl, data.bgOpacity ?? 1);
-  if (data.glowEnabled) applyGlow(data.glowColor || 'violet', data.glowIntensity || 35);
-});
+function requestBackground(message) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(message, response => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(new Error(error.message));
+      else if (!response) reject(new Error('Background не ответил. Перезагрузи расширение и вкладку.'));
+      else resolve(response);
+    });
+  });
+}
 
-const originalFetch = window.fetch;
+function initializeContentSettings() {
+  chrome.storage.local.get(['customBg', 'bgUrl', 'bgOpacity', 'glowEnabled', 'glowColor', 'glowIntensity'], data => {
+    if (data.customBg && data.bgUrl) applyBackground(data.bgUrl, data.bgOpacity ?? 1);
+    if (data.glowEnabled) applyGlow(data.glowColor || 'violet', data.glowIntensity || 35);
+  });
+  requestBackground({ type: 'BOOST_READY' }).catch(error => console.warn('[Starvell Helper]', error.message));
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializeContentSettings, { once: true });
+} else {
+  setTimeout(initializeContentSettings, 0);
+}
 
-// ─── Слушаем команды от background.js / других частей расширения ───
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.type) {
-    case 'TOGGLE_AUTO_BOOST':
-      if (msg.enabled) {
-        startAutoBoost(msg.interval);
-        sendResponse({ ok: true, status: 'started' });
-      } else {
-        stopAutoBoost();
-        sendResponse({ ok: true, status: 'stopped' });
-      }
+    case 'BOOST_PROBE':
+      sendResponse({ ok: true, protocol: 3, version: SH_VERSION, ready: document.readyState !== 'loading', busy: !!boostRunPromise });
       break;
-    case 'BOOST_NOW':
-      boostAllLots().then(result => sendResponse({ ok: true, ...result }));
-      return true; // отвечаем асинхронно
+    case 'BOOST_NOW': {
+      if (!msg.runId) {
+        sendResponse({ ok: false, error: 'Не указан идентификатор запуска.' });
+        break;
+      }
+      if (boostRunPromise) {
+        sendResponse({ ok: false, busy: true, error: 'Поднятие уже выполняется в этой вкладке.' });
+        break;
+      }
+      // Короткое подтверждение: service worker не ждёт сеть/паузы в открытом порту.
+      sendResponse({ ok: true, status: 'accepted', runId: msg.runId });
+      boostAllLots({ automatic: msg.automatic !== false, expiresAt: msg.expiresAt })
+        .then(result => requestBackground({ type: 'BOOST_COMPLETED', runId: msg.runId, result }))
+        .catch(error => console.error('[Starvell Helper] Завершение поднятия:', error));
+      break;
+    }
     case 'APPLY_BG':
       applyBackground(msg.url, msg.opacity);
       sendResponse({ ok: true });
@@ -55,324 +77,343 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-// =====================================================
-//  ПРОВЕРКА АВТОРИЗАЦИИ
-// =====================================================
-
 async function checkAuth() {
-  const username = getCurrentUsername();
-  if (username) return true;
-  const cookie = await new Promise(res => chrome.cookies.get({url: 'https://starvell.com', name: 'session'}, res));
-  if (cookie && cookie.value) return true;
-  const cookies = await new Promise(res => chrome.cookies.getAll({domain: 'starvell.com'}, res));
-  const sessionLike = cookies.find(c => c.value && c.value.length > 20);
-  return !!sessionLike;
+  // user в данных Next.js — владелец авторизованной сессии, в отличие от foreignProfileUser.
+  if (getCurrentUsername()) return true;
+  // cookies API доступен в background, а не в content script.
+  const response = await requestBackground({ type: 'CHECK_AUTH' });
+  return response.authenticated === true;
 }
 
-// =====================================================
-//  ФУНКЦИЯ 1 — Автоподнятие лотов
-// =====================================================
-
-async function startAutoBoost(intervalMinutes) {
-  stopAutoBoost();
-  boostIntervalMs = (intervalMinutes || 30) * 60 * 1000;
-  await boostAllLots(); // ждём первый прогон — если внутри cooldown, перепланирует сама
-  if (!autoBoostInterval) { // только если boostAllLots НЕ перепланировала таймер
-    autoBoostInterval = setInterval(() => boostAllLots(), boostIntervalMs);
-  }
-  console.log('[Starvell Helper] Автоподнятие запущено, интервал:', intervalMinutes, 'мин');
+function startAutoBoost(intervalMinutes) {
+  return requestBackground({ type: 'TOGGLE_AUTO_BOOST', enabled: true, interval: intervalMinutes });
 }
-
 function stopAutoBoost() {
-  if (autoBoostInterval) {
-    clearInterval(autoBoostInterval);
-    autoBoostInterval = null;
+  return requestBackground({ type: 'TOGGLE_AUTO_BOOST', enabled: false });
+}
+
+function getNextData() {
+  try {
+    const node = document.getElementById('__NEXT_DATA__');
+    return node ? JSON.parse(node.textContent) : null;
+  } catch (error) { return null; }
+}
+
+function getCurrentUsername() {
+  const pp = getNextData()?.props?.pageProps || {};
+  // foreignProfileUser и URL относятся к просматриваемому профилю, не к владельцу сессии.
+  return pp.user?.username || pp.bff?.user?.username || null;
+}
+
+function parseNextDataHtml(html) {
+  const match = html.match(/<script\b(?=[^>]*\bid\s*=\s*["']__NEXT_DATA__["'])[^>]*>([\s\S]*?)<\/script>/i);
+  if (!match) throw new Error('Не удалось прочитать данные Starvell. Открой свою страницу профиля.');
+  return JSON.parse(match[1]);
+}
+
+async function fetchWithTimeout(url, options = {}, readResponse = response => response) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const response = await originalFetch(url, { ...options, signal: controller.signal });
+    return await readResponse(response);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// ─── Узнать username текущего пользователя ───
-function getCurrentUsername() {
-  // 1) из __NEXT_DATA__ (если есть)
-  const nd = document.getElementById('__NEXT_DATA__');
-  if (nd) {
-    try {
-      const data = JSON.parse(nd.textContent);
-      const pp = data.props?.pageProps || {};
-      const u = pp.user?.username
-             || pp.bff?.user?.username
-             || pp.foreignProfileUser?.username;
-      if (u) return u;
-    } catch (e) {}
+function loadHomepageData(refresh = false) {
+  if (!homepageDataPromise || refresh) {
+    homepageDataPromise = (async () => {
+      return fetchWithTimeout(`${location.origin}/`, { credentials: 'include', cache: 'no-store' }, async response => {
+        if (!response.ok) throw new Error(`Главная Starvell вернула HTTP ${response.status}`);
+        return parseNextDataHtml(await response.text());
+      });
+    })();
+    homepageDataPromise.catch(() => { homepageDataPromise = null; });
   }
-  // 2) запасной вариант — из URL вида /profile/<username> или /<username>
-  const m = location.pathname.match(/\/profile\/([^/?#]+)/i);
-  if (m) return decodeURIComponent(m[1]);
-  return null;
+  return homepageDataPromise;
 }
- 
-// ─── Получить buildId (нужен для пути _next/data) ───
-async function fetchBuildId() {
-  const nd = document.getElementById('__NEXT_DATA__');
-  if (nd) {
-    try {
-      const data = JSON.parse(nd.textContent);
-      if (data.buildId) return data.buildId;
-    } catch (e) {}
-  }
-  // подстраховка: тянем главную и выдёргиваем buildId из inline-скрипта
-  const html = await originalFetch(window.location.origin, { credentials: 'include' }).then(r => r.text());
-  const match = html.match(/"buildId":"(.*?)"/);
-  if (match) return match[1];
-  throw new Error('buildId not found');
-}
- 
-// ─── ЧТЕНИЕ ЛОТОВ: /profile/{username}.json ───
-// Возвращает массив категорий: [{ categoryId, gameId, gameName, offersCount }]
-async function fetchAllActiveCategories() {
+
+async function resolveCurrentUsername() {
   let username = getCurrentUsername();
   if (!username) {
-    const stored = await new Promise(res => chrome.storage.local.get(['shUsername'], res));
-    username = stored.shUsername;
+    const home = await loadHomepageData(true);
+    const pp = home.props?.pageProps || {};
+    username = pp.user?.username || pp.bff?.user?.username;
   }
-  if (!username) {
-    addLog('error', 'Не удалось определить username — открой свою страницу профиля.');
-    return [];
-  }
-  username = username.toLowerCase();
-
-  const buildId = await fetchBuildId();
-
-  // Загружаем профиль, при необходимости следуем за внутренним N_REDIRECT Next.js
-  async function loadProfileJson(uname, depth = 0) {
-    const url = `${location.origin}/_next/data/${buildId}/profile/`
-              + `${encodeURIComponent(uname)}.json?username=${encodeURIComponent(uname)}`;
-    const resp = await originalFetch(url, {
-      credentials: 'include',
-      headers: { 'x-nextjs-data': '1' }
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const json = await resp.json();
-    // Next.js может вернуть { pageProps: { __N_REDIRECT: "/profile/xxx" } }
-    const redirect = json?.pageProps?.__N_REDIRECT;
-    if (redirect && depth < 2) {
-      const m = redirect.match(/\/profile\/([^/?#]+)/i);
-      if (m) {
-        const target = decodeURIComponent(m[1]);
-        if (target.toLowerCase() !== uname.toLowerCase()) {
-          return loadProfileJson(target.toLowerCase(), depth + 1);
-        }
-      }
-    }
-    return json;
-  }
-
-  let data;
-  try {
-    data = await loadProfileJson(username);
-  } catch (e) {
-    addLog('error', `Не удалось загрузить профиль: ${e.message}`);
-    return [];
-  }
- 
-  const pp = data.pageProps || {};
-  // userProfileOffers лежит и наверху, и в bff — берём первый непустой
-  const categories = (Array.isArray(pp.userProfileOffers) && pp.userProfileOffers.length)
-      ? pp.userProfileOffers
-      : (pp.bff?.userProfileOffers || []);
- 
-  const result = [];
-  for (const cat of categories) {
-    const categoryId = cat.id;
-    const gameId     = cat.gameId ?? cat.game?.id;
-    const offersCnt  = Array.isArray(cat.offers) ? cat.offers.length : 0;
-    // поднимаем только категории, где реально есть офферы
-    if (!categoryId || !gameId || offersCnt === 0) continue;
-    result.push({
-      categoryId,
-      gameId,
-      gameName: cat.game?.name || String(gameId),
-      offersCount: offersCnt
-    });
-  }
- 
-  addLog('info', `Профиль загружен: категорий с лотами — ${result.length}.`);
-  return result;
+  if (!username) throw new Error('Не удалось определить владельца сессии. Войди в аккаунт и открой свой профиль.');
+  await chrome.storage.local.set({ shUsername: username });
+  return username;
 }
- 
-// ─── Группировка: gameId -> [categoryIds] (как делает сайт) ───
-function groupByGame(categories) {
-  const map = new Map(); // gameId -> { gameName, categoryIds:Set }
-  for (const c of categories) {
-    if (!map.has(c.gameId)) map.set(c.gameId, { gameName: c.gameName, categoryIds: new Set() });
-    map.get(c.gameId).categoryIds.add(c.categoryId);
+
+async function fetchBuildId(refresh = false) {
+  if (!refresh && refreshedBuildId) return refreshedBuildId;
+  if (!refresh && getNextData()?.buildId) return getNextData().buildId;
+  const home = await loadHomepageData(refresh);
+  if (!home.buildId) throw new Error('Не удалось определить актуальный buildId Starvell.');
+  refreshedBuildId = home.buildId;
+  return refreshedBuildId;
+}
+
+function extractActiveCategories(pp) {
+  const result = new Map();
+  const knownEmpty = new Set();
+  const catalog = pp.catalogUserProfileOffersResult ?? pp.bff?.catalogUserProfileOffersResult;
+  const legacy = pp.userProfileOffers?.length ? pp.userProfileOffers : (pp.bff?.userProfileOffers || pp.userProfileOffers);
+  const filters = pp.catalogUserProfileOffersFilters || pp.bff?.catalogUserProfileOffersFilters;
+  const categories = Array.isArray(catalog?.categories) ? catalog.categories : legacy;
+  if (!Array.isArray(categories) && !Array.isArray(filters?.games)) {
+    throw new Error('Неизвестный формат профиля Starvell: список категорий отсутствует.');
   }
-  return [...map.entries()].map(([gameId, v]) => ({
-    gameId,
-    gameName: v.gameName,
-    categoryIds: [...v.categoryIds]
+  function add(category, game, fromFilter = false) {
+    const categoryId = Number(category.id);
+    const gameId = Number(category.gameId ?? category.game?.id ?? game?.id);
+    if (!Number.isSafeInteger(categoryId) || categoryId <= 0 || !Number.isSafeInteger(gameId) || gameId <= 0) return;
+    const key = `${gameId}:${categoryId}`;
+    const offersCount = Array.isArray(category.offers) ? category.offers.length : Number(category.offersCount || 0);
+    if (!fromFilter && offersCount === 0) { if (catalog?.hasMore !== true) knownEmpty.add(key); return; }
+    if (fromFilter && knownEmpty.has(key)) return;
+    if (!result.has(key)) result.set(key, {
+      categoryId, categoryName: category.name || String(categoryId),
+      gameId, gameName: category.game?.name || game?.name || String(gameId),
+      offersCount: fromFilter ? null : offersCount
+    });
+  }
+  for (const category of categories || []) add(category);
+  // Это фильтры конкретного профиля продавца, а не общий каталог сайта.
+  // Они дополняют категории, отсутствующие в первой странице карточек лотов.
+  for (const game of filters?.games || []) {
+    for (const category of game.categories || []) add(category, game, true);
+  }
+  if (catalog?.hasMore === true && !filters?.games?.length) {
+    throw new Error('Профиль содержит ещё страницы лотов, но список категорий недоступен. Нужен ответ фильтров Starvell.');
+  }
+  return [...result.values()].sort((a, b) => a.gameId - b.gameId || a.categoryId - b.categoryId);
+}
+
+async function fetchAllActiveCategories() {
+  let username = (await resolveCurrentUsername()).toLowerCase();
+  let buildId = await fetchBuildId();
+  let refreshedBuild = false, refreshedOwner = false, redirectCount = 0;
+  let pp, user;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const url = `${location.origin}/_next/data/${encodeURIComponent(buildId)}/profile/`
+      + `${encodeURIComponent(username)}.json?username=${encodeURIComponent(username)}`;
+    const response = await fetchWithTimeout(url, {
+      credentials: 'include', cache: 'no-store', headers: { 'x-nextjs-data': '1' }
+    }, async response => ({ ok: response.ok, status: response.status, data: response.ok ? await response.json() : null }));
+    if ((response.status === 404 || response.status === 410) && !refreshedBuild) {
+      refreshedBuild = true;
+      buildId = await fetchBuildId(true);
+      continue;
+    }
+    if (!response.ok) throw new Error(`Профиль Starvell вернул HTTP ${response.status}`);
+    pp = response.data?.pageProps || {};
+    if (pp.__N_REDIRECT) {
+      const redirect = pp.__N_REDIRECT.match(/^\/profile\/([^/?#]+)(?:[/?#]|$)/i);
+      if (redirect && redirectCount++ < 2 && decodeURIComponent(redirect[1]).toLowerCase() === username.toLowerCase()) { username = decodeURIComponent(redirect[1]); continue; }
+      throw new Error('Starvell перенаправил запрос профиля. Войди в аккаунт и открой свой профиль.');
+    }
+    user = pp.user || pp.bff?.user;
+    // Авторизацию поднятия определяет свежий ответ сайта. Извлечение Secret Key для POST не требуется.
+    if (!user?.username) throw new Error('Вы не авторизованы на Starvell. Войдите в аккаунт.');
+    const owner = user.username.toLowerCase();
+    if (owner !== username.toLowerCase() && !refreshedOwner) {
+      refreshedOwner = true;
+      username = owner;
+      continue;
+    }
+    const profile = pp.foreignProfileUser || pp.bff?.foreignProfileUser;
+    if (owner !== username.toLowerCase() || (profile && ((user.id && String(user.id) !== String(profile.id))
+        || (profile.username && profile.username.toLowerCase() !== owner)))) {
+      throw new Error('Ответ Starvell относится к другому профилю. Открой свой профиль и повтори.');
+    }
+    const categories = extractActiveCategories(pp);
+    const games = groupByGame(categories);
+    const previous = (await chrome.storage.local.get(['shBoostCatalog'])).shBoostCatalog;
+    const signature = JSON.stringify(categories.map(category => [category.gameId, category.categoryId, category.offersCount]));
+    const snapshot = {
+      owner, userId: user.id == null ? null : String(user.id), checkedAt: Date.now(),
+      categories, games, signature,
+      totalOffers: categories.reduce((sum, category) => sum + (category.offersCount || 0), 0),
+      offersCountComplete: categories.every(category => category.offersCount !== null)
+    };
+    await chrome.storage.local.set({ shUsername: user.username, shBoostCatalog: snapshot });
+    if (previous?.owner !== owner || previous.signature !== signature) {
+      addLog('info', `Каталог обновлён: ${games.length} игр/сервисов, ${categories.length} категорий с лотами.`);
+    }
+    return categories;
+  }
+  throw new Error('Не удалось получить актуальный профиль Starvell после повторной проверки.');
+}
+
+function groupByGame(categories) {
+  const map = new Map();
+  for (const category of categories) {
+    if (!map.has(category.gameId)) map.set(category.gameId, { gameName: category.gameName, categoryIds: new Set() });
+    map.get(category.gameId).categoryIds.add(category.categoryId);
+  }
+  return [...map.entries()].map(([gameId, value]) => ({
+    gameId, gameName: value.gameName, categoryIds: [...value.categoryIds]
   }));
 }
 
-// ─── ГЛАВНАЯ: поднять все игры (по одному bump на игру) ───
-async function boostAllLots() {
-  if (!(await checkAuth())) {
-    const msg = '⚠ Вы не авторизованы на Starvell. Войдите в аккаунт.';
-    addLog('error', msg);
-    chrome.runtime.sendMessage({ type: 'SHOW_NOTIFICATION', text: msg });
-    return { count: 0, failed: 1, rateLimit: false, cooldownSec: 0 };
-  }
-
-  // 🔥 НОВОЕ: fallback username из storage, если сейчас не на профиле
-  let username = getCurrentUsername();
-  if (!username) {
-    const stored = await new Promise(res => chrome.storage.local.get(['shUsername'], res));
-    username = stored.shUsername;
-  } else {
-    chrome.storage.local.set({ shUsername: username }); 
-  }
-
-  const categories = await fetchAllActiveCategories();
-  if (!categories.length) {
-    const msg = '⚠ Активных лотов не найдено. Открой свою страницу профиля и попробуй снова.';
-    addLog('error', msg);
-    chrome.runtime.sendMessage({ type: 'SHOW_NOTIFICATION', text: msg });
-    return { count: 0, failed: 1, rateLimit: false, cooldownSec: 0 };
-  }
-
-  const games = groupByGame(categories);
-  addLog('info', `Поднимаю ${games.length} игр(ы), всего категорий: ${categories.length}.`);
-
-  let successCount = 0, failCount = 0, rateLimited = false;
-  let cooldownSec = 0; 
-
-  for (let i = 0; i < games.length; i++) {
-    const { gameId, gameName, categoryIds } = games[i];
-    addLog('info', `${gameName} (id ${gameId}): ${categoryIds.length} категорий...`);
-
-    const result = await sendBumpWithRetry(gameId, categoryIds);
-
-    // 🔥 НОВОЕ: обработка cooldown
-    if (result.cooldown) {
-      rateLimited = true;
-      cooldownSec = Math.max(cooldownSec, result.retryAfter);
-      addLog('warn', `⏳ Cooldown «${gameName}» — ждать ${Math.round(result.retryAfter/60)} мин`);
-      // Cooldown обычно общий на аккаунт, остальные игры тоже пропускаем
-      break;
-    }
-
-    if (result.status === 429) {
-      rateLimited = true;
-      addLog('warn', `Rate limit на «${gameName}» — пропускаем.`);
-      failCount++;
-    } else if (result.ok && result.body?.success !== false) {
-      successCount++;
-      addLog('ok', `✅ ${gameName} поднята (${categoryIds.length} кат.).`);
-    } else {
-      failCount++;
-      const errMsg = result.body?.message || `ошибка ${result.status}`;
-      addLog('error', `❌ ${gameName}: ${errMsg}.`);
-    }
-
-    if (i < games.length - 1) await sleep(2500); // пауза между играми против 429
-  }
-
-  // 🔥 НОВОЕ: перепланируем автоподнятие, если был cooldown
-  if (cooldownSec > 0) {
-    const nextMs = (cooldownSec + 60) * 1000; // +1 минута запаса
-    addLog('info', `⏳ Автоподнятие перепланировано через ${Math.round(nextMs/60000)} мин`);
-    rescheduleAutoBoost(nextMs);
-  }
-
-  const msg = successCount
-    ? `✅ Поднято игр: ${successCount} из ${games.length}.`
-    : (cooldownSec > 0 ? `⏳ Cooldown — следующий подъём через ${Math.round(cooldownSec/60)} мин.` : `⚠ Не удалось поднять ни одной игры.`);
-  chrome.runtime.sendMessage({ type: 'SHOW_NOTIFICATION', text: msg });
-  addLog(successCount ? 'ok' : (cooldownSec > 0 ? 'warn' : 'warn'), msg);
-
-  return { count: successCount, failed: failCount, rateLimit: rateLimited, cooldownSec };
+function parseRetryAfter(value, now = Date.now()) {
+  if (value == null || String(value).trim() === '') return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, (date - now) / 1000) : 0;
 }
 
-function rescheduleAutoBoost(ms) {
-  stopAutoBoost();
-  boostIntervalMs = ms;
-
-  // Пересоздаём интервал
-  autoBoostInterval = setInterval(() => boostAllLots(), boostIntervalMs);
-
-  // Обновляем UI
-  updateBoostTimerUI(ms);
+function bumpCooldown(result) {
+  const body = result.body || {};
+  const extras = [body.data, body.extra, body.error?.data, body.error?.extra, body.error, body];
+  const detail = extras.find(value => value?.code === 'OFFERS_BUMP_COOLDOWN');
+  const rateLimit = result.status === 429;
+  if (!detail && !rateLimit) return null;
+  const seconds = Number(detail?.retryAfterSeconds
+    ?? extras.find(value => value?.retryAfterSeconds != null)?.retryAfterSeconds);
+  const header = result.headers?.get('Retry-After');
+  const validHeader = header != null && String(header).trim() !== ''
+    && ((Number.isFinite(Number(header)) && Number(header) >= 0) || Number.isFinite(Date.parse(header)));
+  const retryAfter = Number.isFinite(seconds) && seconds >= 0
+    ? seconds : validHeader ? parseRetryAfter(header) : (detail ? 3600 : 90);
+  return { retryAfter, global: rateLimit && !detail };
 }
 
-function updateBoostTimerUI(ms) {
-  const statusEl = document.getElementById('sh-boost-status-text');
-  const dot = document.getElementById('sh-boost-dot');
-  if (!statusEl) return;
-
-  if (dot) dot.className = 'sh-dot inactive';
-
-  const deadline = Date.now() + ms;
-
-  // Очищаем старый таймер обновления текста
-  if (window._shBoostTimer) clearInterval(window._shBoostTimer);
-
-  window._shBoostTimer = setInterval(() => {
-    const left = deadline - Date.now();
-    if (left <= 0) {
-      clearInterval(window._shBoostTimer);
-      if (dot) dot.className = 'sh-dot active';
-      statusEl.textContent = 'Активно — поднимаю...';
-      return;
-    }
-    const m = Math.floor(left / 60000);
-    const s = Math.floor((left % 60000) / 1000);
-    statusEl.textContent = `⏳ Cooldown — следующий подъём через ${m}:${String(s).padStart(2,'0')}`;
-  }, 1000);
-}
-
-// Вспомогательная функция с повторной попыткой при 429
-async function sendBumpWithRetry(gameId, categoryIds, retryCount = 0) {
-  const result = await sendBump(gameId, categoryIds);
-
-  // 🔥 НОВОЕ: ловим cooldown от сервера (200 OK, но success: false)
-  if (result.body?.success === false && result.body?.data?.code === 'OFFERS_BUMP_COOLDOWN') {
-    return {
-      ...result,
-      cooldown: true,
-      retryAfter: result.body.data.retryAfterSeconds || 3600
-    };
-  }
-
-  if (result.status === 429 && retryCount < 2) {
-    const retryAfter = parseInt(result.headers?.get('Retry-After')) || 90;
-    addLog('warn', `429 на gameId=${gameId}, ждём ${retryAfter} сек...`);
-    await sleep(retryAfter * 1000);
-    return sendBumpWithRetry(gameId, categoryIds, retryCount + 1);
-  }
-  return result;
-}
-
-// Обновлённая sendBump, возвращающая объект с ok, status, headers
 async function sendBump(gameId, categoryIds) {
-  const body = JSON.stringify({ gameId, categoryIds });
-  console.log('[Starvell Helper] Отправляем bump:', body);
   try {
-    const resp = await originalFetch('/api/offers/bump', {
+    const response = await fetchWithTimeout('/api/offers/bump', {
       method: 'POST', credentials: 'include',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body
-    });
-    let json = {};
-    try { json = await resp.json(); } catch(e) {}
-    return {
-      ok: resp.ok,
-      status: resp.status,
-      body: json,
-      headers: resp.headers
-    };
-  } catch (e) {
-    console.error('[Starvell Helper] Ошибка fetch:', e);
-    return { ok: false, status: 0, body: {}, headers: new Headers() };
+      body: JSON.stringify({ gameId, categoryIds })
+    }, async response => ({ ok: response.ok, status: response.status, headers: response.headers, text: await response.text() }));
+    const text = response.text;
+    let body = {};
+    if (text.trim()) {
+      try { body = JSON.parse(text); }
+      catch (error) { return { ok: false, status: response.status, body: {}, headers: response.headers, error: 'Starvell вернул ответ не в формате JSON.' }; }
+    }
+    return { ok: response.ok, status: response.status, body: body || {}, headers: response.headers };
+  } catch (error) {
+    return { ok: false, status: 0, body: {}, headers: new Headers(), error: error.name === 'AbortError' ? 'Превышено время ожидания Starvell.' : error.message };
   }
+}
+
+async function sendBumpWithRetry(gameId, categoryIds) {
+  // Cooldown перепланирует Chrome Alarm; вкладка не спит 90+ секунд и не повторяет POST.
+  const result = await sendBump(gameId, categoryIds);
+  const cooldown = bumpCooldown(result);
+  return cooldown ? { ...result, cooldown: true, ...cooldown } : result;
+}
+
+function boostAllLots(options = {}) {
+  if (boostRunPromise) return boostRunPromise;
+  boostRunPromise = performBoost(options).catch(error => {
+    const message = `❌ ${error.message}`;
+    addLog('error', message);
+    requestBackground({ type: 'SHOW_NOTIFICATION', text: message }).catch(console.warn);
+    return { count: 0, failed: 1, rateLimit: false, cooldownSec: 0, nextDelayMs: BOOST_ERROR_RETRY_MS, message };
+  }).finally(() => { boostRunPromise = null; });
+  return boostRunPromise;
+}
+
+async function performBoost({ automatic = false, expiresAt = Infinity } = {}) {
+  const settings = await chrome.storage.local.get([
+    'autoBoost', 'boostInterval', 'shUsername', 'shBoostStateOwner', 'shBoostGameStates',
+    'shBoostCooldowns', 'shBoostRateLimitUntil'
+  ]);
+  if (automatic && !settings.autoBoost) return { count: 0, failed: 0, cancelled: true };
+  if (Date.now() >= expiresAt) throw new Error('Истекло время запуска. Повторная проверка будет выполнена позже.');
+  const interval = Number(settings.boostInterval);
+  const baseMs = (Number.isFinite(interval) && interval >= 0.5 ? interval : 120) * 60000 + BOOST_SAFETY_MS;
+
+  // Плановое обнаружение — раз в 30 минут. Перед поднятием также читаем свежий профиль.
+  const categories = await fetchAllActiveCategories();
+  const catalog = (await chrome.storage.local.get(['shBoostCatalog'])).shBoostCatalog;
+  const owner = catalog.owner;
+  const sameOwner = settings.shBoostStateOwner === owner;
+  const legacyOwner = !settings.shBoostStateOwner && String(settings.shUsername || '').toLowerCase() === owner;
+  const states = sameOwner ? { ...(settings.shBoostGameStates || {}) } : {};
+  let globalUntil = sameOwner || legacyOwner ? Number(settings.shBoostRateLimitUntil) || 0 : 0;
+  if (legacyOwner) {
+    for (const [gameId, until] of Object.entries(settings.shBoostCooldowns || {})) {
+      if (Number(until) > Date.now()) states[gameId] = { nextAt: Number(until), cooldownUntil: Number(until), reason: 'cooldown' };
+    }
+  }
+  const games = groupByGame(categories);
+  // Обновляем состав каждой игры до проверки сроков: добавленные категории сохраняются и во время cooldown.
+  for (const game of games) {
+    const state = { ...(states[game.gameId] || {}), categoryIds: game.categoryIds, gameName: game.gameName };
+    if (state.reason === 'interval' && state.lastSuccessAt) state.nextAt = Number(state.lastSuccessAt) + baseMs;
+    states[game.gameId] = state;
+  }
+  // Необработанные игры имеют приоритет перед повторным поднятием уже обработанных.
+  // При большом каталоге это позволяет продолжить очередь после ограничения времени запуска.
+  games.sort((a, b) => (Number(states[a.gameId].nextAt) || 0) - (Number(states[b.gameId].nextAt) || 0));
+  async function saveState() {
+    const cooldowns = {};
+    for (const [gameId, state] of Object.entries(states)) {
+      if (Number(state.cooldownUntil) > Date.now()) cooldowns[gameId] = Number(state.cooldownUntil);
+    }
+    await chrome.storage.local.set({ shBoostStateOwner: owner, shBoostGameStates: states, shBoostCooldowns: cooldowns, shBoostRateLimitUntil: globalUntil });
+  }
+
+  let count = 0, failed = 0, attempted = 0, skipped = 0, cancelled = false;
+  let rateLimit = globalUntil > Date.now();
+  for (let i = 0; i < games.length; i++) {
+    if (Date.now() >= expiresAt) { failed++; addLog('error', 'Истекло время запуска. Остальные игры будут проверены позже.'); break; }
+    if (automatic && !(await chrome.storage.local.get(['autoBoost'])).autoBoost) { cancelled = true; break; }
+    const { gameId, gameName, categoryIds } = games[i];
+    const state = states[gameId];
+    const cooling = Number(state.cooldownUntil) > Date.now();
+    if (cooling) rateLimit = true;
+    if (globalUntil > Date.now() || cooling || (automatic && Number(state.nextAt) > Date.now())) { skipped++; continue; }
+    attempted++;
+    addLog('info', `${gameName} (id ${gameId}): поднимаю ${categoryIds.length} категорий.`);
+    const result = await sendBumpWithRetry(gameId, categoryIds);
+    if (result.cooldown) {
+      rateLimit = true;
+      const until = Date.now() + result.retryAfter * 1000 + BOOST_SAFETY_MS;
+      if (result.global) globalUntil = until;
+      else Object.assign(state, { nextAt: until, cooldownUntil: until, reason: 'cooldown', retryAfterSeconds: result.retryAfter });
+      addLog('warn', `⏳ ${gameName}: cooldown ${Math.ceil(result.retryAfter / 60)} мин (+1 мин запаса).`);
+      await saveState();
+      if (result.global) break;
+    } else if (result.ok && result.body?.success !== false && !result.body?.error) {
+      const successAt = Date.now();
+      Object.assign(state, { lastSuccessAt: successAt, nextAt: successAt + baseMs, cooldownUntil: 0, reason: 'interval' });
+      count++;
+      addLog('ok', `✅ ${gameName} поднята (${categoryIds.length} кат.).`);
+      await saveState(); // результат сохраняется сразу, в том числе при последующем закрытии вкладки
+    } else {
+      Object.assign(state, { nextAt: Date.now() + BOOST_ERROR_RETRY_MS, reason: 'error' });
+      failed++;
+      const message = result.error || result.body?.message || result.body?.data?.message || result.body?.error?.message || `HTTP ${result.status}`;
+      addLog('error', `❌ ${gameName}: ${message}`);
+      if (result.status === 401 || result.status === 403) break;
+    }
+    if (i < games.length - 1) await sleep(2500);
+  }
+  await saveState();
+  const now = Date.now();
+  const dueTimes = games.map(game => Math.max(Number(states[game.gameId].nextAt) || now, globalUntil));
+  const nextBumpAt = dueTimes.length ? Math.max(now, Math.min(...dueTimes)) : 0;
+  const nextDelayMs = nextBumpAt ? Math.min(BOOST_DISCOVERY_MS, Math.max(30000, nextBumpAt - now)) : BOOST_DISCOVERY_MS;
+  const cooldownTimes = games.map(game => Number(states[game.gameId].cooldownUntil)).filter(time => time > now);
+  const cooldownSec = globalUntil > now ? Math.ceil((globalUntil - now) / 1000)
+    : cooldownTimes.length ? Math.ceil((Math.min(...cooldownTimes) - now) / 1000) : 0;
+  const message = cancelled ? `Автоподнятие остановлено. Поднято игр/сервисов: ${count}.`
+    : count ? `✅ Поднято игр/сервисов: ${count} из ${games.length}.`
+    : failed ? '⚠ Не удалось поднять предложения. Подробности в логе.'
+    : !games.length ? 'Активных лотов нет. Продолжаю проверять профиль на новые предложения.'
+    : rateLimit ? '⏳ Ожидаю cooldown. Новые игры и категории продолжаю проверять.'
+    : 'Ожидаю следующего срока поднятия. Профиль проверяется на новые предложения.';
+  if (attempted || failed || cancelled) addLog(count ? 'ok' : failed ? 'error' : 'warn', message);
+  if (attempted || failed) await requestBackground({ type: 'SHOW_NOTIFICATION', text: message }).catch(console.warn);
+  return { count, failed, attempted, skipped, cancelled, rateLimit, cooldownSec, nextDelayMs, nextBumpAt, message, totalGames: games.length, profileOwner: owner };
 }
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -433,7 +474,7 @@ function applyBackground(imageUrl, opacity = 0.15) {
     background-repeat: no-repeat; background-attachment: fixed;
     opacity: ${opacity}; pointer-events: none;
   `;
-  document.documentElement.appendChild(overlay);
+  document.body.appendChild(overlay);
 
   // 2) делаем непрозрачные блоки сайта прозрачными, чтобы фон был виден
   const style = document.createElement('style');
@@ -458,6 +499,14 @@ function removeBackground() {
 //  ФУНКЦИЯ 3 — Session key
 // =====================================================
 
+function sessionKeyFeedback(text, type) {
+  const element = document.getElementById('sh-session-feedback');
+  if (!element) return;
+  element.textContent = text;
+  element.className = 'sh-feedback ' + (type === 'ok' ? 'ok' : 'err');
+  element.style.display = 'block';
+}
+
 function loadSessionKey() {
   const displayEl = document.getElementById('sh-session-display');
   if (!displayEl) return;
@@ -470,11 +519,10 @@ function loadSessionKey() {
         fallbackLoadSession();
         return;
       }
-      if (resp && resp.success && resp.value && resp.value.length > 20) {
+      if (resp && resp.success && typeof resp.value === 'string' && resp.value.length > 20) {
         currentSessionKey = resp.value;
         renderSessionKey();
-        shFeedback('sh-session-feedback', '✓ Ключ загружен (background)', 'ok');
-        console.log('[SH] Session from background:', resp.value.slice(0, 8) + '...');
+        sessionKeyFeedback('✓ Ключ загружен (background)', 'ok');
         return;
       }
       console.warn('[SH] Background не нашёл session, пробуем fallback...');
@@ -491,9 +539,10 @@ function loadSessionKey() {
     // Пробуем document.cookie
     const dc = document.cookie;
     if (dc) {
-      const pairs = dc.split(';').map(s => s.trim().split('=')).filter(p => p.length === 2);
+      const pairs = dc.split(';').map(s => { const at = s.indexOf('='); return [s.slice(0, at).trim(), s.slice(at + 1)]; });
       for (const [n, v] of pairs) {
-        const dec = decodeURIComponent(v);
+        let dec;
+        try { dec = decodeURIComponent(v); } catch (error) { continue; }
         if (n.trim() === 'session' && (uuidRe.test(dec) || dec.length > 30)) {
           return setKey(dec, 'document.cookie');
         }
@@ -519,13 +568,13 @@ function loadSessionKey() {
   function setKey(value, source) {
     currentSessionKey = value;
     renderSessionKey();
-    shFeedback('sh-session-feedback', `✓ Ключ найден (${source})`, 'ok');
+    sessionKeyFeedback(`✓ Ключ найден (${source})`, 'ok');
   }
 
   function noKey() {
     currentSessionKey = '';
     renderSessionKey();
-    shFeedback('sh-session-feedback', '⚠ Ключ не найден. Проверь авторизацию на starvell.com', 'err');
+    sessionKeyFeedback('⚠ Ключ не найден. Проверь авторизацию на starvell.com', 'err');
   }
 }
 
